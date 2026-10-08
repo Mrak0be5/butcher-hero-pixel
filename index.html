@@ -6097,9 +6097,10 @@ CHR.portrait = function (kind, anim, f, rows, flags = {}) {
 // ---------------------------------------------------------------------------
 // island-1 content of Butcher Hero 2.0.4 (commit 18b38128): spawners, trees, rewards, texts.
 // positions are game metres (x, z); numbers are the original config values.
-// TUNE scales them for this demo (the original island is balanced around coming back stronger)
+// TUNE scales them for this demo (the original island is balanced around coming back stronger);
+// with ?orig in the URL every enemy keeps its original HP and damage
 // ---------------------------------------------------------------------------
-const TUNE = {
+const TUNE = new URLSearchParams(location.search).has('orig') ? { enemyDmg: 1 } : {
   enemyDmg: 0.35, // every enemy hit
   knight2: { hp: 0.7, dmg: 0.35 },
   boss: { hp: 0.5, dmg: 0.25 },
@@ -6647,8 +6648,8 @@ class Tree {
     this.flash = Math.max(0, this.flash - dt / 0.15);
     this.shakeT += dt; this.lastHurt += dt;
     if (this.state === 'alive') {
-      if (this.dist > 30 * PPM) this.hp = this.maxHp;
-      else if (this.lastHurt > 5 && this.hp < this.maxHp) this.hp = Math.min(this.maxHp, this.hp + this.maxHp * 0.05 * dt);
+      // static units never leash-heal (only the AI does that), they just regenerate
+      if (this.lastHurt > 5 && this.hp < this.maxHp) this.hp = Math.min(this.maxHp, this.hp + this.maxHp * 0.05 * dt);
       this.hpShown = this.hpShown > this.hp ? Math.max(this.hp, this.hpShown - this.maxHp * 0.8 * dt) : this.hp;
     } else if (this.state === 'stump') {
       this.timer -= dt;
@@ -6789,7 +6790,8 @@ class Spawner {
     const i = this.units.indexOf(e);
     if (i >= 0) this.units.splice(i, 1);
     this.kills++;
-    if (this.timer < 0) this.timer = this.def.cd;
+    // the timer starts on the first kill from a full spawner and restarts whenever it becomes empty
+    if (this.timer < 0 || !this.units.length) this.timer = this.def.cd;
   }
   update(dt) {
     if (this.timer < 0) return;
@@ -9895,7 +9897,12 @@ Game.onHeroDeath = function () {
 
 // back at the camp pond with 1 HP: every enemy heals and backs off, island 1 again
 Game.onHeroRevive = function () {
-  for (const e of this.enemies) { e.hp = e.hpShown = e.maxHp; e.disengage(); e.retreatT = 3; }
+  // every unit heals, trees included; the ones still on the aggro timer (they were fighting) run home for 3 s
+  for (const e of this.enemies) {
+    e.hp = e.hpShown = e.maxHp;
+    if (e.engaged || e.aggroT > 0) { e.disengage(); e.retreatT = 3; e.aggroT = 0; }
+  }
+  for (const t of this.trees) if (t.state === 'alive') t.hp = t.hpShown = t.maxHp;
   this.island = 1;
   this.tintTo = 0;
   this.bossOn = false;
@@ -10869,7 +10876,16 @@ window.__state = () => {
       const due = performance.now() + 15;
       const spin = () => { if (!waiting) return; if (performance.now() >= due) frame(performance.now()); else post(spin); };
       post(spin);
-    } else if (!wd) wd = setTimeout(() => { wd = 0; if (performance.now() - lastRaf > 250) frame(performance.now()); }, 300);
+    } else armWd();
+  };
+  // the watchdog re-arms itself until either an animation frame or its own fallback frame has run
+  const armWd = () => {
+    if (wd) return;
+    wd = setTimeout(() => {
+      wd = 0;
+      if (!waiting) return;
+      if (performance.now() - lastRaf > 250) frame(performance.now()); else armWd();
+    }, 300);
   };
   next();
 
