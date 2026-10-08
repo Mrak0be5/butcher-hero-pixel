@@ -4224,441 +4224,366 @@ Spr.softBlob = function (rx, ry, seed = 1) {
 <script>
 'use strict';
 // ---------------------------------------------------------------------------
-// characters: every unit is a small 3D rig (joints carrying ellipsoids, boxes,
-// cylinders and cones) posed per animation frame and rasterised into pixel art:
-// hue-shifted 5-tone ramps in cel bands, specular glints, surface patterns
-// (stitches, stains, mail, bark, moss...), contour lines between overlapping
-// parts and a selective outline. Frames render on demand in 8 directions
+// characters: 2D pixel art drawn per view. Every unit is a cut-out rig with
+// three hand-built views (front, back, right side; the left side mirrors the
+// right side's geometry while the light stays top-left). A part is a list of
+// vector shapes (ellipses, rounded boxes, tapered capsules, polygons) that are
+// rasterised straight into pixels: 4 tone bands from a top-left light, a dark
+// silhouette outline and contour lines where a part passes in front of another.
+// Faces, masks, emblems and other small details are pixel decals placed by hand.
+// Animations pose the parts per frame; frames render on demand and are cached
 // ---------------------------------------------------------------------------
-const CHR_EL = 30 * DEG, CHR_CE = Math.cos(CHR_EL), CHR_SE = Math.sin(CHR_EL);
-const CHR_N = v => { const m = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / m, v[1] / m, v[2] / m]; };
-// light from the upper left, a little in front; camera space (x right, y up, z into the screen)
-const CHR_L = CHR_N([-0.62, 0.72, -0.3]);
-const CHR_HV = CHR_N([CHR_L[0], CHR_L[1], CHR_L[2] - 1]);
-const CHR_INK = [20, 13, 26];
-const CHR_Z0 = -2000;
+const CHR_L = (() => { const v = [-0.55, -0.72, 0.62], m = Math.hypot(v[0], v[1], v[2]); return [v[0] / m, v[1] / m, v[2] / m]; })();
+const CHR_INK = [22, 13, 18];
 
-// ---- 3x3 matrices, row-major ------------------------------------------------
-const chrM = {
-  mul(a, b) {
-    return [
-      a[0] * b[0] + a[1] * b[3] + a[2] * b[6], a[0] * b[1] + a[1] * b[4] + a[2] * b[7], a[0] * b[2] + a[1] * b[5] + a[2] * b[8],
-      a[3] * b[0] + a[4] * b[3] + a[5] * b[6], a[3] * b[1] + a[4] * b[4] + a[5] * b[7], a[3] * b[2] + a[4] * b[5] + a[5] * b[8],
-      a[6] * b[0] + a[7] * b[3] + a[8] * b[6], a[6] * b[1] + a[7] * b[4] + a[8] * b[7], a[6] * b[2] + a[7] * b[5] + a[8] * b[8],
-    ];
-  },
-  rx(a) { const c = Math.cos(a), s = Math.sin(a); return [1, 0, 0, 0, c, -s, 0, s, c]; },
-  ry(a) { const c = Math.cos(a), s = Math.sin(a); return [c, 0, s, 0, 1, 0, -s, 0, c]; },
-  rz(a) { const c = Math.cos(a), s = Math.sin(a); return [c, -s, 0, s, c, 0, 0, 0, 1]; },
-  // Euler [pitch x, yaw y, roll z] applied as Ry * Rx * Rz
-  eul(e) {
-    if (!e || (!e[0] && !e[1] && !e[2])) return [1, 0, 0, 0, 1, 0, 0, 0, 1];
-    return chrM.mul(chrM.mul(chrM.ry(e[1] || 0), chrM.rx(e[0] || 0)), chrM.rz(e[2] || 0));
-  },
-  vec(m, v) { return [m[0] * v[0] + m[1] * v[1] + m[2] * v[2], m[3] * v[0] + m[4] * v[1] + m[5] * v[2], m[6] * v[0] + m[7] * v[1] + m[8] * v[2]]; },
-  cols(m, s) { return [m[0] * s[0], m[1] * s[1], m[2] * s[2], m[3] * s[0], m[4] * s[1], m[5] * s[2], m[6] * s[0], m[7] * s[1], m[8] * s[2]]; },
-  inv(m) {
-    const a = m[0], b = m[1], c = m[2], d = m[3], e = m[4], f = m[5], g = m[6], h = m[7], i = m[8];
-    const A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
-    const det = a * A + b * B + c * C || 1e-9, k = 1 / det;
-    return [
-      A * k, -(b * i - c * h) * k, (b * f - c * e) * k,
-      B * k, (a * i - c * g) * k, -(a * f - c * d) * k,
-      C * k, -(a * h - b * g) * k, (a * e - b * d) * k,
-    ];
-  },
-};
-// world (y up, z toward the viewer) -> camera
-const CHR_C = [1, 0, 0, 0, CHR_CE, -CHR_SE, 0, -CHR_SE, -CHR_CE];
-
-// ---- palettes: 5 tones, darkest first ----------------------------------------
 function chrRamp(...hx) { return hx.map(hex); }
 function chrPack(c) { return ((255 << 24) | (Math.round(c[2]) << 16) | (Math.round(c[1]) << 8) | Math.round(c[0])) >>> 0; }
 
-// material: { r: ramp, spec, specT, rim, dither, flat (unlit index), glow }
+// material: r = 5 tones [contour line, deep shadow, shadow, base, light];
+// t = band thresholds on n.L; out = silhouette outline colour; flat = flattens the shading
 function chrMat(r, o = {}) {
-  const m = Object.assign({ r, spec: null, specT: 0.93, rim: true, dither: false, flat: -1, band: [0.42, 0.65, 0.86] }, o);
+  const m = Object.assign({ r, t: [-0.12, 0.28, 0.74], flat: 0 }, o);
   m.u = r.map(chrPack);
-  m.o = chrPack(mix(r[0], CHR_INK, 0.55));
-  m.su = m.spec ? chrPack(hex(m.spec)) : 0;
+  m.o = chrPack(o.out ? hex(o.out) : mix(r[0], CHR_INK, 0.62));
+  m.l = chrPack(o.line ? hex(o.line) : r[0]);
   return m;
 }
+// unlit pixels of the weapon sprites keep their own colours; only the outline comes from here
+const CHR_WPN_MAT = chrMat(chrRamp('#1c1a24', '#2c2a36', '#4a4a5a', '#8a90a4', '#d8e0ee'), { out: '#14111a' });
 
-// small deterministic noise for patterns (unit-space coordinates)
-function chrNoise(x, y, s = 0) { return valueNoise(x, y, s); }
+// shapes, in part-local pixels (y down, origin = the part's pivot)
+const chrE = (x, y, rx, ry, m, o) => Object.assign({ t: 'e', x, y, rx, ry, m }, o);
+const chrB = (x, y, rx, ry, rad, m, o) => Object.assign({ t: 'b', x, y, rx, ry, rad, m }, o);
+const chrCap = (ax, ay, bx, by, ra, rb, m, o) => Object.assign({ t: 'c', ax, ay, bx, by, ra, rb, m }, o);
+const chrPoly = (pts, m, o) => Object.assign({ t: 'p', pts, m }, o);
+// decal: hand-placed pixels. (x, y) = top-left in part space; rows of characters; pal maps a
+// character to '#rrggbb' or [material, tone]; '.' and ' ' are empty. free: may draw outside the part
+const chrD = (x, y, rows, pal, o) => Object.assign({ x, y, rows, pal }, o);
 
-// ---- rig evaluation -----------------------------------------------------------
-// model: { joints: [{n, p (parent), at}], parts: [{j, s (shape), at, r, rot, m, g, pat, if}], size, anchor, pts }
-// pose: { j: { name: [rx, ry, rz] }, t: [x, y, z] root offset (model space), s: [horizontal, vertical] squash, f: flags }
-function chrSolve(model, pose, yaw, k) {
-  const J = {}, R0 = chrM.ry(yaw);
-  for (const jd of model.joints) {
-    const e = pose.j[jd.n];
-    let R = chrM.eul(e);
-    if (jd.rest) R = chrM.mul(chrM.eul(jd.rest), R);
-    if (!jd.p) {
-      const t = pose.t || [0, 0, 0];
-      const p = chrM.vec(R0, [(jd.at[0] + t[0]) * k, (jd.at[1] + t[1]) * k, (jd.at[2] + t[2]) * k]);
-      J[jd.n] = { R: chrM.mul(R0, R), p };
-    } else {
-      const off = pose.o && pose.o[jd.n], at = off ? [jd.at[0] + off[0], jd.at[1] + off[1], jd.at[2] + off[2]] : jd.at;
-      const P = J[jd.p], o = chrM.vec(P.R, [at[0] * k, at[1] * k, at[2] * k]);
-      J[jd.n] = { R: chrM.mul(P.R, R), p: [P.p[0] + o[0], P.p[1] + o[1], P.p[2] + o[2]] };
-    }
+// 2x3 affine maps [a, b, c, d, e, f]: X = a x + c y + e, Y = b x + d y + f
+const chrAff = {
+  id: () => [1, 0, 0, 1, 0, 0],
+  mul: (m, n) => [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1], m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3],
+    m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]],
+  tr: (x, y) => [1, 0, 0, 1, x, y],
+  // positive degrees turn clockwise on screen
+  rot: deg => { const a = deg * DEG, c = Math.cos(a), s = Math.sin(a); return [c, s, -s, c, 0, 0]; },
+  sc: (sx, sy) => [sx, 0, 0, sy, 0, 0],
+  inv: m => {
+    const det = m[0] * m[3] - m[1] * m[2] || 1e-9, a = m[3] / det, b = -m[1] / det, c = -m[2] / det, d = m[0] / det;
+    return [a, b, c, d, -(a * m[4] + c * m[5]), -(b * m[4] + d * m[5])];
+  },
+  ap: (m, x, y) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]],
+};
+
+// local bounding box of a shape
+function chrShapeBox(s) {
+  if (s.t === 'e') { const r = s.rot ? Math.max(s.rx, s.ry) : 0; return r ? [s.x - r, s.y - r, s.x + r, s.y + r] : [s.x - s.rx, s.y - s.ry, s.x + s.rx, s.y + s.ry]; }
+  if (s.t === 'b') return [s.x - s.rx, s.y - s.ry, s.x + s.rx, s.y + s.ry];
+  if (s.t === 'c') return [Math.min(s.ax - s.ra, s.bx - s.rb), Math.min(s.ay - s.ra, s.by - s.rb), Math.max(s.ax + s.ra, s.bx + s.rb), Math.max(s.ay + s.ra, s.by + s.rb)];
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of s.pts) { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
+  return [x0, y0, x1, y1];
+}
+
+// hit test: fills H = [nx, ny, nz, u, v] (normal in part space; u, v normalised shape coords) or returns false
+const CHR_H = [0, 0, 1, 0, 0];
+function chrHit(s, lx, ly) {
+  const H = CHR_H;
+  if (s.t === 'e') {
+    let dx = lx - s.x, dy = ly - s.y;
+    if (s.rot) { const a = -s.rot * DEG, c = Math.cos(a), sn = Math.sin(a), tx = dx * c - dy * sn; dy = dx * sn + dy * c; dx = tx; }
+    const u = dx / s.rx, v = dy / s.ry, q = u * u + v * v;
+    if (q > 1) return false;
+    H[0] = u; H[1] = v; H[2] = Math.sqrt(1 - q); H[3] = u; H[4] = v;
+    if (s.rot) { const a = s.rot * DEG, c = Math.cos(a), sn = Math.sin(a), tx = H[0] * c - H[1] * sn; H[1] = H[0] * sn + H[1] * c; H[0] = tx; }
+    return true;
   }
-  return J;
+  if (s.t === 'b') {
+    const dx = lx - s.x, dy = ly - s.y, ax = Math.abs(dx), ay = Math.abs(dy);
+    if (ax > s.rx || ay > s.ry) return false;
+    const r = Math.max(0.01, Math.min(s.rad, s.rx, s.ry));
+    const qx = Math.max(ax - (s.rx - r), 0), qy = Math.max(ay - (s.ry - r), 0), d = Math.hypot(qx, qy);
+    if (d > r) return false;
+    // rounded edges plus a gentle dome over the flat face
+    const ex = (dx < 0 ? -qx : qx) / r, ey = (dy < 0 ? -qy : qy) / r;
+    const nx = ex * 0.78 + (dx / s.rx) * 0.42, ny = ey * 0.78 + (dy / s.ry) * 0.42;
+    H[0] = nx; H[1] = ny; H[2] = Math.sqrt(Math.max(0.04, 1 - nx * nx - ny * ny)); H[3] = dx / s.rx; H[4] = dy / s.ry;
+    return true;
+  }
+  if (s.t === 'c') {
+    const bx = s.bx - s.ax, by = s.by - s.ay, L2 = bx * bx + by * by || 1e-6;
+    const px = lx - s.ax, py = ly - s.ay;
+    const t = Math.max(0, Math.min(1, (px * bx + py * by) / L2));
+    const r = s.ra + (s.rb - s.ra) * t, cx = px - bx * t, cy = py - by * t, d = Math.hypot(cx, cy);
+    if (d > r) return false;
+    H[0] = cx / r; H[1] = cy / r; H[2] = Math.sqrt(Math.max(0, 1 - (d / r) * (d / r)));
+    H[3] = t; H[4] = (bx * cy - by * cx < 0 ? -d : d) / r;
+    return true;
+  }
+  // polygon: even-odd rule, bevelled edges
+  const P = s.pts, n = P.length;
+  let inside = false;
+  for (let i = 0, j = n - 1; i < n; j = i++) {
+    const xi = P[i][0], yi = P[i][1], xj = P[j][0], yj = P[j][1];
+    if ((yi > ly) !== (yj > ly) && lx < ((xj - xi) * (ly - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  if (!inside) return false;
+  const bev = s.bev === undefined ? 2.2 : s.bev;
+  let best = 1e9, enx = 0, eny = 0;
+  for (let i = 0, j = n - 1; i < n; j = i++) {
+    const ax = P[j][0], ay = P[j][1], ex = P[i][0] - ax, ey = P[i][1] - ay, L2 = ex * ex + ey * ey || 1e-6;
+    const t = Math.max(0, Math.min(1, ((lx - ax) * ex + (ly - ay) * ey) / L2));
+    const dx = lx - (ax + ex * t), dy = ly - (ay + ey * t), d = Math.hypot(dx, dy);
+    if (d < best) { best = d; enx = -dx / (d || 1); eny = -dy / (d || 1); }
+  }
+  const k = bev > 0 ? Math.max(0, 1 - best / bev) * 0.75 : 0;
+  const bb = s._bb || (s._bb = chrShapeBox(s));
+  H[0] = enx * k; H[1] = eny * k; H[2] = Math.sqrt(1 - k * k);
+  H[3] = ((lx - bb[0]) / (bb[2] - bb[0] || 1)) * 2 - 1; H[4] = ((ly - bb[1]) / (bb[3] - bb[1] || 1)) * 2 - 1;
+  return true;
 }
 
-// a point in joint space -> canvas offset from the anchor [dx, dy] and camera depth
-function chrProject(J, jn, at, k, sq) {
-  const J0 = J[jn], o = chrM.vec(J0.R, [at[0] * k, at[1] * k, at[2] * k]);
-  let w = [J0.p[0] + o[0], J0.p[1] + o[1], J0.p[2] + o[2]];
-  if (sq) w = [w[0] * sq[0], w[1] * sq[1], w[2] * sq[0]];
-  const c = chrM.vec(CHR_C, w);
-  return [c[0], -c[1], c[2]];
-}
-
-// ---- rasteriser -----------------------------------------------------------------
-// two buffer sets: frames rendered on demand, and the sliced background job
-const CHR_BUF = { n: 0 }, CHR_BUF_BG = { n: 0 };
-function chrBuffers(B, n) {
+// ---- rendering ----------------------------------------------------------------
+const CHR_BUF = { n: 0 };
+function chrBuffers(n) {
+  const B = CHR_BUF;
   if (B.n < n) {
     B.n = n;
-    B.dep = new Float32Array(n); B.pid = new Int16Array(n); B.col = new Uint32Array(n);
-    B.lv = new Int8Array(n); B.line = new Uint8Array(n); B.mats = new Array(n);
+    B.pid = new Int16Array(n); B.grp = new Int32Array(n); B.col = new Uint32Array(n); B.mat = new Array(n); B.ln = new Uint8Array(n);
   }
   return B;
 }
 
-// render one frame; returns { cv, ax, ay, w, h, top, pts }
-function chrRender(model, pose, dir, k = 1, BS = CHR_BUF) {
-  const it = chrRenderJob(model, pose, dir, k, BS);
-  for (;;) { const r = it.next(); if (r.done) return r.value; }
+// part transforms for a pose; mirror flips the whole rig about the anchor
+function chrSolve(view, P, mirror) {
+  const R = P.root || {};
+  let root = chrAff.tr(R.x || 0, R.y || 0);
+  if (R.r) root = chrAff.mul(root, chrAff.rot(R.r));
+  root = chrAff.mul(root, chrAff.sc((mirror ? -1 : 1) * (R.sx || 1), R.sy || 1));
+  const T = {};
+  // parents first, whatever the listing order
+  const order = view._order || (view._order = (() => {
+    const out = [], done = new Set(), list = view.parts.slice();
+    while (list.length) {
+      const i = list.findIndex(pd => !pd.p || done.has(pd.p));
+      if (i < 0) throw new Error('chars: unresolved parent ' + list[0].p);
+      const pd = list.splice(i, 1)[0];
+      out.push(pd); done.add(pd.n);
+    }
+    return out;
+  })());
+  for (const pd of order) {
+    const base = pd.p ? T[pd.p] : root, off = P.o[pd.n], s = P.s[pd.n];
+    let m = chrAff.mul(base, chrAff.tr(pd.at[0] + (off ? off[0] : 0), pd.at[1] + (off ? off[1] : 0)));
+    const r = (pd.r0 || 0) + (P.r[pd.n] || 0);
+    if (r) m = chrAff.mul(m, chrAff.rot(r));
+    if (s) m = chrAff.mul(m, chrAff.sc(s[0], s[1]));
+    T[pd.n] = m;
+  }
+  return T;
 }
 
-// the same as a resumable job: it yields after every part and between the passes
-function* chrRenderJob(model, pose, dir, k, BS) {
-  let ms = 0, ts = performance.now();
-  const face = dir * (Math.PI / 4), yaw = Math.PI / 2 - face;
-  const J = chrSolve(model, pose, yaw, k);
-  const sq = pose.s ? [pose.s[0], pose.s[1]] : null;
-  const W = Math.ceil(model.size[0] * k), H = Math.ceil(model.size[1] * k);
-  const ax = Math.round(model.anchor[0] * k), ay = Math.round(model.anchor[1] * k);
-  const N = W * H, B = chrBuffers(BS, N);
-  B.ay = ay; B.k = k;
-  const dep = B.dep, pid = B.pid, col = B.col, lv = B.lv, line = B.line;
-  dep.fill(1e9, 0, N); pid.fill(-1, 0, N); line.fill(0, 0, N);
-  const flags = pose.f || {};
-  const items = [];
-  model.parts.forEach((pd, idx) => {
-    if (pd.if && !pd.if(flags)) return;
-    const J0 = J[pd.j];
-    let R = J0.R;
-    let rot = pd.rot;
-    if (pd.pose) { const e = pose.j[pd.pose]; if (e) rot = rot ? [rot[0] + e[0], rot[1] + e[1], rot[2] + e[2]] : e; }
-    if (rot) R = chrM.mul(R, chrM.eul(rot));
-    if (pd.s === 'rc') {
-      // round cone: endpoints a (pd.at) and b (pd.b) in joint space, radii r[0] at a and r[1] at b
-      const ends = [pd.at, pd.b].map(q => {
-        const o2 = chrM.vec(J0.R, [q[0] * k, q[1] * k, q[2] * k]);
-        let w = [J0.p[0] + o2[0], J0.p[1] + o2[1], J0.p[2] + o2[2]];
-        if (sq) w = [w[0] * sq[0], w[1] * sq[1], w[2] * sq[0]];
-        return chrM.vec(CHR_C, w);
-      });
-      const sk = sq ? (sq[0] + sq[1]) / 2 : 1, ra = pd.r[0] * k * sk, rb = pd.r[1] * k * sk, rm = Math.max(ra, rb);
-      const [pa, pb] = ends;
-      const x0 = Math.max(0, Math.floor(ax + Math.min(pa[0], pb[0]) - rm - 1)), x1 = Math.min(W - 1, Math.ceil(ax + Math.max(pa[0], pb[0]) + rm + 1));
-      const y0 = Math.max(0, Math.floor(ay - Math.max(pa[1], pb[1]) - rm - 1)), y1 = Math.min(H - 1, Math.ceil(ay - Math.min(pa[1], pb[1]) + rm + 1));
-      if (x0 > x1 || y0 > y1) return;
-      const Rc = chrM.mul(CHR_C, R);
-      items.push({ pd, idx, pa, pb, ra, rb, ex: [Rc[0], Rc[3], Rc[6]], ez: [Rc[2], Rc[5], Rc[8]], zs: Math.min(pa[2], pb[2]) - rm - 8, x0, x1, y0, y1, mat: model.mats[pd.m] });
-      return;
+function chrDecalColor(M, pal, ch) {
+  const c = pal[ch];
+  if (c === undefined) return 0;
+  if (typeof c === 'string') return chrPack(hex(c));
+  const m = M.mats[c[0]];
+  return c[1] === 'o' ? m.o : m.u[c[1]];
+}
+
+function chrRender(M, view, P, mirror) {
+  const t0 = performance.now();
+  const W = M.size[0], H = M.size[1], ax = M.anchor[0], ay = M.anchor[1], N = W * H;
+  const B = chrBuffers(N), pid = B.pid, grp = B.grp, col = B.col, mat = B.mat, ln = B.ln;
+  pid.fill(-1, 0, N); ln.fill(0, 0, N);
+  const T = chrSolve(view, P, mirror), F = P.f;
+  const parts = view.parts.filter(pd => !P.h[pd.n] && (!pd.if || pd.if(F)) && (pd.sh || pd.wpn || pd.dc));
+  parts.sort((a, b) => (a.z + (P.z[a.n] || 0)) - (b.z + (P.z[b.n] || 0)));
+  const L0 = CHR_L[0], L1 = CHR_L[1], L2 = CHR_L[2];
+  const box = (m, lb) => {
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+    for (const [x, y] of [[lb[0], lb[1]], [lb[2], lb[1]], [lb[0], lb[3]], [lb[2], lb[3]]]) {
+      const q = chrAff.ap(m, x, y);
+      if (q[0] < x0) x0 = q[0]; if (q[0] > x1) x1 = q[0]; if (q[1] < y0) y0 = q[1]; if (q[1] > y1) y1 = q[1];
     }
-    let M = chrM.cols(R, [pd.r[0] * k, pd.r[1] * k, pd.r[2] * k]);
-    const o = chrM.vec(J0.R, [pd.at[0] * k, pd.at[1] * k, pd.at[2] * k]);
-    let c = [J0.p[0] + o[0], J0.p[1] + o[1], J0.p[2] + o[2]];
-    if (sq) { M = chrM.mul([sq[0], 0, 0, 0, sq[1], 0, 0, 0, sq[0]], M); c = [c[0] * sq[0], c[1] * sq[1], c[2] * sq[0]]; }
-    const Mc = chrM.mul(CHR_C, M), cc = chrM.vec(CHR_C, c), Mi = chrM.inv(Mc);
-    // screen extents: support of the shape along camera x and y
-    const s = pd.s, ex = s === 'box' ? Math.abs(Mc[0]) + Math.abs(Mc[1]) + Math.abs(Mc[2]) : Math.hypot(Mc[0], Mc[1], Mc[2]);
-    const ey = s === 'box' ? Math.abs(Mc[3]) + Math.abs(Mc[4]) + Math.abs(Mc[5]) : Math.hypot(Mc[3], Mc[4], Mc[5]);
-    const ex2 = s === 'cyl' || s === 'cone' ? Math.hypot(Mc[0], Mc[2]) + Math.abs(Mc[1]) : ex;
-    const ey2 = s === 'cyl' || s === 'cone' ? Math.hypot(Mc[3], Mc[5]) + Math.abs(Mc[4]) : ey;
-    const x0 = Math.max(0, Math.floor(ax + cc[0] - ex2 - 1)), x1 = Math.min(W - 1, Math.ceil(ax + cc[0] + ex2 + 1));
-    const y0 = Math.max(0, Math.floor(ay - cc[1] - ey2 - 1)), y1 = Math.min(H - 1, Math.ceil(ay - cc[1] + ey2 + 1));
-    if (x0 > x1 || y0 > y1) return;
-    items.push({ pd, idx, Mi, cc, x0, x1, y0, y1, mat: model.mats[pd.m] });
+    return [Math.max(0, Math.floor(x0 + ax) - 1), Math.max(0, Math.floor(y0 + ay) - 1), Math.min(W - 1, Math.ceil(x1 + ax) + 1), Math.min(H - 1, Math.ceil(y1 + ay) + 1)];
+  };
+  parts.forEach((pd, oi) => {
+    const m = T[pd.n], Mi = chrAff.inv(m), sx = Math.hypot(m[0], m[1]) || 1, sy = Math.hypot(m[2], m[3]) || 1;
+    // weapon sprites: the blade runs along +x from the grip
+    if (pd.wpn) {
+      const id = pd.wpn[0] === '$' ? F[pd.wpn.slice(1)] : pd.wpn, Wp = id && WEAPONS[id];
+      if (Wp) {
+        const k = pd.wsc || 1, [X0, Y0, X1, Y1] = box(m, [Wp.u0 * k - 1, Wp.v0 * k - 1, Wp.u1 * k + 1, Wp.v1 * k + 1]);
+        for (let py = Y0; py <= Y1; py++) for (let px = X0; px <= X1; px++) {
+          const fx = px + 0.5 - ax, fy = py + 0.5 - ay;
+          const lx = Mi[0] * fx + Mi[2] * fy + Mi[4], ly = Mi[1] * fx + Mi[3] * fy + Mi[5];
+          const c = Wp.px(lx / k, ly / k);
+          if (!c) continue;
+          const p = py * W + px;
+          pid[p] = oi; grp[p] = oi * 256; col[p] = chrPack(c); mat[p] = CHR_WPN_MAT; ln[p] = 0;
+        }
+      }
+    }
+    for (let si = 0; si < (pd.sh ? pd.sh.length : 0); si++) {
+      const s = pd.sh[si];
+      if (s.if && !s.if(F)) continue;
+      const m0 = M.mats[s.m];
+      const [X0, Y0, X1, Y1] = box(m, s._lb || (s._lb = chrShapeBox(s)));
+      const flat = s.flat !== undefined ? s.flat : m0.flat, g = oi * 256 + (s.g || 0);
+      for (let py = Y0; py <= Y1; py++) for (let px = X0; px <= X1; px++) {
+        const fx = px + 0.5 - ax, fy = py + 0.5 - ay;
+        const lx = Mi[0] * fx + Mi[2] * fy + Mi[4], ly = Mi[1] * fx + Mi[3] * fy + Mi[5];
+        if (!chrHit(s, lx, ly)) continue;
+        let mm = m0, tone, raw = 0;
+        // part-space normal -> screen (rotation / mirror of the part), flattened toward the viewer
+        let nx = CHR_H[0], ny = CHR_H[1], nz = CHR_H[2];
+        const snx = (m[0] * nx + m[2] * ny) / sx, sny = (m[1] * nx + m[3] * ny) / sy;
+        nx = snx * (1 - flat); ny = sny * (1 - flat); nz = nz + flat;
+        const nl = Math.hypot(nx, ny, nz) || 1, d = (nx * L0 + ny * L1 + nz * L2) / nl;
+        let off = 0, abs = -1;
+        if (s.pat) {
+          const r = s.pat(CHR_H[3], CHR_H[4], lx, ly, F, P.view);
+          if (r === 'x') continue;
+          if (r) {
+            if (typeof r === 'number') off = r;
+            else if (typeof r === 'string') mm = M.mats[r];
+            else if (r.c) raw = chrPack(hex(r.c));
+            else { if (r.m) mm = M.mats[r.m]; if (r.d) off = r.d; if (r.i !== undefined) abs = r.i; }
+          }
+        }
+        const t = mm.t;
+        tone = d < t[0] ? 1 : d < t[1] ? 2 : d < t[2] ? 3 : 4;
+        if (abs >= 0) tone = abs; else if (off) tone = Math.max(1, Math.min(4, tone + off));
+        const p = py * W + px;
+        pid[p] = oi; grp[p] = g; col[p] = raw || mm.u[tone]; mat[p] = mm; ln[p] = s.ln ? 1 : 0;
+      }
+    }
   });
-  // the parts, nearest surface wins
-  for (let q = 0; q < items.length; q++) {
-    const it = items[q];
-    if (it.pd.s === 'rc') chrRasterRC(it, model, flags, W, ax, ay, B);
-    else chrRasterM(it, model, flags, W, ax, ay, B);
-    ms += performance.now() - ts; yield; ts = performance.now();
-  }
-  // contour lines: where a part from another group passes in front, darken the far pixel
-  const parts = model.parts, T = 3.2 * k;
-  for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
-    if (i === 0 && j && (j & 63) === 0) { ms += performance.now() - ts; yield; ts = performance.now(); }
-    const p = j * W + i, a = pid[p];
+  // contour pass: silhouette outline, lines where a part lies over an earlier one, group lines
+  const out = new Uint32Array(N);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const p = y * W + x, a = pid[p];
     if (a < 0) continue;
-    const ga = parts[a].g;
-    for (let s = 0; s < 2; s++) {
-      const q = s ? p + W : p + 1;
-      if (s ? j + 1 >= H : i + 1 >= W) continue;
-      const b = pid[q];
-      if (b < 0 || parts[b].g === ga) continue;
-      if (dep[p] > dep[q] + T) line[p] = 1; else if (dep[q] > dep[p] + T) line[q] = 1;
+    let edge = false, line = false;
+    for (let k = 0; k < 4; k++) {
+      const qx = k === 0 ? x - 1 : k === 1 ? x + 1 : x, qy = k === 2 ? y - 1 : k === 3 ? y + 1 : y;
+      if (qx < 0 || qy < 0 || qx >= W || qy >= H) { edge = true; break; }
+      const q = qy * W + qx, b = pid[q];
+      if (b < 0) { edge = true; break; }
+      if (b < a && !parts[a].noLine) line = true;
+      else if (b === a && grp[q] !== grp[p] && ln[p] && grp[q] < grp[p]) line = true;
+    }
+    out[p] = edge ? (parts[a].out ? chrPack(hex(parts[a].out)) : mat[p].o) : line ? mat[p].l : col[p];
+  }
+  // decals, in part order
+  parts.forEach((pd, oi) => {
+    if (!pd.dc) return;
+    const m = T[pd.n], Mi = chrAff.inv(m);
+    for (const dcl of pd.dc) {
+      if (dcl.if && !dcl.if(F, P.view)) continue;
+      const rows = dcl.rows, h = rows.length, w = rows.reduce((a, r) => Math.max(a, r.length), 0);
+      const [X0, Y0, X1, Y1] = box(m, [dcl.x, dcl.y, dcl.x + w, dcl.y + h]);
+      for (let py = Y0; py <= Y1; py++) for (let px = X0; px <= X1; px++) {
+        const fx = px + 0.5 - ax, fy = py + 0.5 - ay;
+        const lx = Mi[0] * fx + Mi[2] * fy + Mi[4], ly = Mi[1] * fx + Mi[3] * fy + Mi[5];
+        const gx = Math.floor(lx - dcl.x), gy = Math.floor(ly - dcl.y);
+        if (gx < 0 || gy < 0 || gy >= h || gx >= rows[gy].length) continue;
+        const ch = rows[gy][gx];
+        if (ch === '.' || ch === ' ') continue;
+        const p = py * W + px;
+        if (!dcl.free && pid[p] !== oi) continue;
+        const c = chrDecalColor(M, dcl.pal, ch);
+        if (!c) continue;
+        out[p] = c;
+        if (pid[p] < 0) pid[p] = oi;
+      }
+    }
+  });
+  // petrification: everything below the stone line turns to stone, a cold rim rides the line
+  if (F.stoneY !== undefined && M.mats.stone) {
+    const S = M.mats.stone, lim = F.stoneY;
+    for (let y = 0; y < H; y++) {
+      const hgt = ay - (y + 0.5);
+      if (hgt >= lim + 1.5) continue;
+      for (let x = 0; x < W; x++) {
+        const p = y * W + x;
+        if (pid[p] < 0) continue;
+        if (hgt >= lim) { out[p] = chrPack([200, 250, 255]); continue; }
+        const c = out[p], r = c & 255, g = (c >> 8) & 255, b2 = (c >> 16) & 255, lum = (r * 0.3 + g * 0.55 + b2 * 0.15) / 255;
+        out[p] = lum < 0.16 ? S.o : S.u[Math.max(1, Math.min(4, Math.round(lum * 4.6)))];
+      }
     }
   }
-  ms += performance.now() - ts; yield; ts = performance.now();
-  const img = new ImageData(W, H), u = new Uint32Array(img.data.buffer), mats = B.mats;
-  for (let p = 0; p < N; p++) {
-    if (pid[p] < 0) continue;
-    u[p] = line[p] ? mats[p].u[0] : col[p];
-  }
-  // selective outline around the silhouette
-  let minY = H, minX = W, maxX = -1, maxY = -1;
-  for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
-    if (i === 0 && j && (j & 63) === 0) { ms += performance.now() - ts; yield; ts = performance.now(); }
-    const p = j * W + i;
-    if (pid[p] >= 0) continue;
-    let q = -1;
-    if (i > 0 && pid[p - 1] >= 0) q = p - 1;
-    else if (i < W - 1 && pid[p + 1] >= 0) q = p + 1;
-    else if (j < H - 1 && pid[p + W] >= 0) q = p + W;
-    else if (j > 0 && pid[p - W] >= 0) q = p - W;
-    if (q < 0) continue;
-    u[p] = mats[q].o;
-  }
-  for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
-    if (!u[j * W + i]) continue;
-    if (j < minY) minY = j; if (j > maxY) maxY = j; if (i < minX) minX = i; if (i > maxX) maxX = i;
+  // crop to the drawn pixels
+  let minX = W, minY = H, maxX = -1, maxY = -1;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (pid[y * W + x] < 0) continue;
+    if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y;
   }
   const pts = {};
-  for (const n in model.pts || {}) {
-    const P = model.pts[n], c = chrProject(J, P[0], P[1], k, sq);
-    pts[n] = [c[0], c[1], c[2]];
+  for (const n in view.pts || {}) {
+    const q = view.pts[n], m = T[q[0]];
+    if (m) pts[n] = chrAff.ap(m, q[1], q[2]);
   }
   let cv;
-  if (maxX < 0) { [cv] = makeCanvas(1, 1); minX = minY = 0; }
+  if (maxX < 0) { [cv] = makeCanvas(1, 1); minX = ax; minY = ay; }
   else {
-    // only the bounding box of the drawn pixels is kept
     const cw = maxX - minX + 1, ch = maxY - minY + 1;
+    const img = new ImageData(cw, ch), u = new Uint32Array(img.data.buffer);
+    for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) { const p = (y + minY) * W + x + minX; if (pid[p] >= 0) u[y * cw + x] = out[p]; }
     const [c2, g2] = makeCanvas(cw, ch);
-    g2.putImageData(img, -minX, -minY, minX, minY, cw, ch);
+    g2.putImageData(img, 0, 0);
     cv = c2;
   }
-  CHR.stats.n++; CHR.stats.ms += ms + performance.now() - ts;
+  CHR.stats.n++; CHR.stats.ms += performance.now() - t0;
   return { cv, ax: ax - minX, ay: ay - minY, w: cv.width, h: cv.height, top: ay - minY, pts, white: null, red: null, black: null };
 }
 
-// shade one surface sample into the buffers (nearest-wins already checked by the caller)
-// lx, ly, lz: pattern coordinates; n: camera-space unit normal
-function chrShade(B, p, i, j, depth, pi, mat, model, pat, flags, lx, ly, lz, nx, ny, nz) {
-  let m = mat, idx, out = 0;
-  if (pat) {
-    const r = pat(lx, ly, lz, nx, ny, nz, flags);
-    if (r === 'x') return;
-    if (r) {
-      if (typeof r === 'number') idx = r;
-      else if (typeof r === 'string') m = model.mats[r];
-      else if (r.c !== undefined) out = r.c;
-      else { if (r.m) m = model.mats[r.m]; if (r.d) idx = r.d; if (r.i !== undefined) idx = 100 + r.i; }
-    }
-  }
-  // petrification: everything below the stone line turns to stone, a cold glow rides the line
-  let rim = false;
-  if (flags.stoneY !== undefined && model.mats.stone) {
-    const wy = (B.ay - (j + 0.5)) * CHR_CE - depth * CHR_SE, lim = flags.stoneY * B.k;
-    if (wy < lim) { m = model.mats.stone; out = 0; if (idx !== undefined && idx < 100) idx = undefined; }
-    else if (wy < lim + 1.6 * B.k) rim = true;
-  }
-  if (out) { B.col[p] = out; B.lv[p] = 2; }
-  else if (rim) { B.col[p] = chrPack([200, 250, 255]); B.lv[p] = 4; }
-  else {
-    let shade;
-    if (m.flat >= 0) shade = m.flat;
-    else {
-      const d = nx * CHR_L[0] + ny * CHR_L[1] + nz * CHR_L[2];
-      let l = d * 0.5 + 0.5;
-      if (m.dither) l += (bayer(i, j) - 0.5) * 0.05;
-      const bd = m.band;
-      shade = l < bd[0] ? 1 : l < bd[1] ? 2 : l < bd[2] ? 3 : 4;
-      // back rim: a lit edge along the right silhouette
-      if (m.rim && shade <= 2 && nx > 0.62 && nz > -0.35) shade++;
-    }
-    if (idx !== undefined) shade = idx >= 100 ? idx - 100 : clamp(shade + idx, 0, 4);
-    let c = m.u[shade];
-    if (m.spec && shade >= 3) {
-      const s2 = nx * CHR_HV[0] + ny * CHR_HV[1] + nz * CHR_HV[2];
-      if (s2 > m.specT) c = m.su;
-    }
-    B.col[p] = c; B.lv[p] = shade;
-  }
-  B.dep[p] = depth; B.pid[p] = pi; B.mats[p] = m;
-}
+// ---- frames, cache, views ---------------------------------------------------------
+const CHR = { models: {}, cache: new Map(), stats: { n: 0, ms: 0, sync: 0 }, queue: [], warmed: new Set(), job: null };
 
-// ellipsoids, boxes, cylinders and cones: rays in the part's unit space
-function chrRasterM(it, model, flags, W, ax, ay, B) {
-  const Mi = it.Mi, pd = it.pd, mat = it.mat, shape = pd.s, pat = pd.pat, dep = B.dep;
-  const dx = Mi[2], dy = Mi[5], dz = Mi[8];
-  const zc = CHR_Z0 - it.cc[2];
-  for (let j = it.y0; j <= it.y1; j++) {
-    const Y = ay - (j + 0.5) - it.cc[1];
-    for (let i = it.x0; i <= it.x1; i++) {
-      const X = i + 0.5 - ax - it.cc[0];
-      const ox = Mi[0] * X + Mi[1] * Y + Mi[2] * zc, oy = Mi[3] * X + Mi[4] * Y + Mi[5] * zc, oz = Mi[6] * X + Mi[7] * Y + Mi[8] * zc;
-      let t = -1, nx = 0, ny = 0, nz = 0;
-      if (shape === 'ell') {
-        const a = dx * dx + dy * dy + dz * dz, b = ox * dx + oy * dy + oz * dz, c = ox * ox + oy * oy + oz * oz - 1;
-        const disc = b * b - a * c;
-        if (disc < 0) continue;
-        t = (-b - Math.sqrt(disc)) / a;
-        nx = ox + t * dx; ny = oy + t * dy; nz = oz + t * dz;
-      } else if (shape === 'box') {
-        let tn = -1e9, tf = 1e9, axn = 0, sg = 0, miss = false;
-        for (let a2 = 0; a2 < 3; a2++) {
-          const d = a2 === 0 ? dx : a2 === 1 ? dy : dz, o2 = a2 === 0 ? ox : a2 === 1 ? oy : oz;
-          if (Math.abs(d) < 1e-9) { if (o2 < -1 || o2 > 1) { miss = true; break; } continue; }
-          let ta = (-1 - o2) / d, tb = (1 - o2) / d, s2 = -1;
-          if (ta > tb) { const tmp = ta; ta = tb; tb = tmp; s2 = 1; }
-          if (ta > tn) { tn = ta; axn = a2; sg = s2; }
-          if (tb < tf) tf = tb;
-          if (tn > tf) { miss = true; break; }
-        }
-        if (miss) continue;
-        t = tn;
-        nx = axn === 0 ? sg : 0; ny = axn === 1 ? sg : 0; nz = axn === 2 ? sg : 0;
-      } else if (shape === 'cyl') {
-        let best = 1e9;
-        const a = dx * dx + dz * dz;
-        if (a > 1e-12) {
-          const b = ox * dx + oz * dz, c = ox * ox + oz * oz - 1, disc = b * b - a * c;
-          if (disc >= 0) {
-            const ts = (-b - Math.sqrt(disc)) / a, yy = oy + ts * dy;
-            if (yy >= -1 && yy <= 1) { best = ts; nx = ox + ts * dx; ny = 0; nz = oz + ts * dz; }
-          }
-        }
-        if (Math.abs(dy) > 1e-9) {
-          for (let cap = -1; cap <= 1; cap += 2) {
-            const tc = (cap - oy) / dy;
-            if (tc >= best) continue;
-            const px = ox + tc * dx, pz = oz + tc * dz;
-            if (px * px + pz * pz <= 1) { best = tc; nx = 0; ny = cap; nz = 0; }
-          }
-        }
-        if (best === 1e9) continue;
-        t = best;
-      } else if (shape === 'cone') {
-        // apex at y = +1, radius 1 at y = -1
-        let best = 1e9;
-        const kk = 0.25, A = dx * dx + dz * dz - kk * dy * dy, Bq = ox * dx + oz * dz + kk * (1 - oy) * dy, Cq = ox * ox + oz * oz - kk * (1 - oy) * (1 - oy);
-        if (Math.abs(A) > 1e-12) {
-          const disc = Bq * Bq - A * Cq;
-          if (disc >= 0) {
-            const sd = Math.sqrt(disc);
-            for (let r2 = 0; r2 < 2; r2++) {
-              const tt = r2 ? (-Bq + sd) / A : (-Bq - sd) / A, yy = oy + tt * dy;
-              if (yy >= -1 && yy <= 1 && tt < best) { best = tt; nx = ox + tt * dx; ny = kk * (1 - yy); nz = oz + tt * dz; }
-            }
-          }
-        }
-        if (Math.abs(dy) > 1e-9) {
-          const tc = (-1 - oy) / dy;
-          if (tc < best) { const px = ox + tc * dx, pz = oz + tc * dz; if (px * px + pz * pz <= 1) { best = tc; nx = 0; ny = -1; nz = 0; } }
-        }
-        if (best === 1e9) continue;
-        t = best;
-      }
-      const depth = CHR_Z0 + t, p = j * W + i;
-      if (depth >= dep[p]) continue;
-      let cnx = Mi[0] * nx + Mi[3] * ny + Mi[6] * nz, cny = Mi[1] * nx + Mi[4] * ny + Mi[7] * nz, cnz = Mi[2] * nx + Mi[5] * ny + Mi[8] * nz;
-      const nl = Math.hypot(cnx, cny, cnz) || 1;
-      chrShade(B, p, i, j, depth, it.idx, mat, model, pat, flags, ox + t * dx, oy + t * dy, oz + t * dz, cnx / nl, cny / nl, cnz / nl);
-    }
-  }
-}
-
-// round cones (tapered capsules): ray / rounded-cone intersection after Inigo Quilez
-function chrRasterRC(it, model, flags, W, ax, ay, B) {
-  const { pa, pb, ra, rb, pd, mat, ex, ez, zs } = it, pat = pd.pat, dep = B.dep;
-  const bax = pb[0] - pa[0], bay = pb[1] - pa[1], baz = pb[2] - pa[2];
-  const rr = ra - rb, m0 = bax * bax + bay * bay + baz * baz, d2 = m0 - rr * rr, m2 = baz, k2 = d2 - m2 * m2;
-  const rm = (ra + rb) / 2;
-  for (let j = it.y0; j <= it.y1; j++) {
-    const Y = ay - (j + 0.5);
-    for (let i = it.x0; i <= it.x1; i++) {
-      const X = i + 0.5 - ax;
-      const oax = X - pa[0], oay = Y - pa[1], oaz = zs - pa[2];
-      const obx = X - pb[0], oby = Y - pb[1], obz = zs - pb[2];
-      const m1 = bax * oax + bay * oay + baz * oaz, m3 = oaz, m5 = oax * oax + oay * oay + oaz * oaz;
-      const m6 = obz, m7 = obx * obx + oby * oby + obz * obz;
-      let t = 1e20, nx = 0, ny = 0, nz = 0;
-      if (Math.abs(k2) > 1e-9) {
-        const k1 = d2 * m3 - m1 * m2 + m2 * rr * ra, k0 = d2 * m5 - m1 * m1 + m1 * rr * ra * 2 - m0 * ra * ra;
-        const h = k1 * k1 - k0 * k2;
-        if (h >= 0) {
-          const tt = (-Math.sqrt(h) - k1) / k2, yy = m1 - ra * rr + tt * m2;
-          if (yy > 0 && yy < d2) { t = tt; nx = d2 * oax - bax * yy; ny = d2 * oay - bay * yy; nz = d2 * (oaz + tt) - baz * yy; }
-        }
-      }
-      if (t === 1e20) {
-        const h1 = m3 * m3 - m5 + ra * ra, h2 = m6 * m6 - m7 + rb * rb;
-        if (h1 > 0) { const tt = -m3 - Math.sqrt(h1); t = tt; nx = oax; ny = oay; nz = oaz + tt; }
-        if (h2 > 0) { const tt = -m6 - Math.sqrt(h2); if (tt < t) { t = tt; nx = obx; ny = oby; nz = obz + tt; } }
-        if (t === 1e20) continue;
-      }
-      const depth = zs + t, p = j * W + i;
-      if (depth >= dep[p]) continue;
-      const nl = Math.hypot(nx, ny, nz) || 1;
-      nx /= nl; ny /= nl; nz /= nl;
-      let lx = 0, ly = 0, lz = 0;
-      if (pat) {
-        // pattern space: x, z around the axis (radius ~1), y from +1 at a to -1 at b
-        const px = oax, py = oay, pz = oaz + t;
-        const u = (px * bax + py * bay + pz * baz) / m0;
-        const vx = px - bax * u, vy = py - bay * u, vz = pz - baz * u;
-        lx = (vx * ex[0] + vy * ex[1] + vz * ex[2]) / rm; lz = (vx * ez[0] + vy * ez[1] + vz * ez[2]) / rm; ly = 1 - 2 * u;
-      }
-      chrShade(B, p, i, j, depth, it.idx, mat, model, pat, flags, lx, ly, lz, nx, ny, nz);
-    }
-  }
-}
-
-// ---- frames, cache, silhouettes ------------------------------------------------
-const CHR = { models: {}, cache: new Map(), stats: { n: 0, ms: 0 } };
-
-// 8 directions: 0 = east, 2 = south (toward the camera), 4 = west, 6 = north
-CHR.dirOf = function (face) { return ((Math.round(face / (Math.PI / 4)) % 8) + 8) % 8; };
+// 4 views on the 8-way dir scale: 0 = right (side), 2 = front, 4 = left (mirrored side), 6 = back.
+// prev keeps the current view until the facing is clearly in another quadrant
+CHR.dirOf = function (face, prev) {
+  const c = Math.cos(face), s = Math.sin(face);
+  if (prev === 2 && s > 0.45) return 2;
+  if (prev === 6 && s < -0.45) return 6;
+  if (prev === 0 && c > 0.45) return 0;
+  if (prev === 4 && c < -0.45) return 4;
+  return Math.abs(c) > Math.abs(s) ? (c > 0 ? 0 : 4) : (s > 0 ? 2 : 6);
+};
+const CHR_VIEW = ['side', 'front', 'front', 'front', 'side', 'back', 'back', 'back'];
 
 CHR.anim = function (kind, anim) { return this.models[kind].anims[anim]; };
 
-// frame fi of an animation; opts: weapon id etc. (part of the cache key)
-CHR.spec = function (kind, anim, dir, fi, o) {
-  const M = this.models[kind], A = M.anims[anim];
-  const n = A.n, f = A.loop === false ? clamp(fi, 0, n - 1) : ((fi % n) + n) % n;
-  return { M, A, n, f, key: kind + '|' + anim + '|' + dir + '|' + f + '|' + (o.w || '') + '|' + (o.k || 1) + '|' + (o.v || '') };
+CHR.key = function (kind, anim, dir, fi, o) {
+  const A = this.models[kind].anims[anim], n = A.n;
+  const f = A.loop === false ? clamp(fi, 0, n - 1) : ((fi % n) + n) % n;
+  return [f, kind + '|' + anim + '|' + (dir === 4 ? 'left' : CHR_VIEW[dir] || 'front') + '|' + f + '|' + (o.w || '') + '|' + (o.k || 1) + '|' + (o.v || '')];
 };
-CHR.pose = function (S, o) {
-  const pose = { j: {}, o: {}, t: [0, 0, 0], s: null, f: Object.assign({}, S.M.flags || {}, o.w ? { w: o.w } : {}, o.f || {}) };
-  S.A.fn(S.A.loop === false ? (S.n > 1 ? S.f / (S.n - 1) : 0) : S.f / S.n, pose, o);
-  return pose;
-};
+
+// frame fi of an animation; o: w (weapon id), f (flags), k (integer zoom), v (variant cache key)
 CHR.frame = function (kind, anim, dir, fi, o = {}) {
-  const S = this.spec(kind, anim, dir, fi, o);
-  let fr = this.cache.get(S.key);
+  const [f, key] = this.key(kind, anim, dir, fi, o);
+  let fr = this.cache.get(key);
   if (fr) return fr;
-  const J = this.job;
-  if (J && J.key === S.key) {
-    // the background job is on this very frame: finish it now
-    this.job = null;
-    for (;;) { const r = J.it.next(); if (r.done) { fr = r.value; break; } }
-  } else {
-    fr = chrRender(S.M, this.pose(S, o), dir, (o.k || 1) * (S.M.k || 1));
-    this.stats.sync++;
+  const M = this.models[kind], A = M.anims[anim], view = CHR_VIEW[dir] || 'front';
+  const P = { r: {}, o: {}, s: {}, z: {}, h: {}, root: {}, view, f: Object.assign({}, M.flags || {}, o.w !== undefined ? { w: o.w } : {}, o.f || {}) };
+  A.fn(A.loop === false ? (A.n > 1 ? f / (A.n - 1) : 0) : f / A.n, P, o);
+  fr = chrRender(M, M.views[view], P, dir === 4);
+  const k = o.k || 1;
+  if (k > 1) {
+    const [c, g] = makeCanvas(fr.w * k, fr.h * k);
+    g.imageSmoothingEnabled = false;
+    g.drawImage(fr.cv, 0, 0, fr.w * k, fr.h * k);
+    const pts = {};
+    for (const n in fr.pts) pts[n] = [fr.pts[n][0] * k, fr.pts[n][1] * k];
+    fr = { cv: c, ax: fr.ax * k, ay: fr.ay * k, w: fr.w * k, h: fr.h * k, top: fr.top * k, pts, white: null, red: null, black: null };
   }
-  this.cache.set(S.key, fr);
+  this.cache.set(key, fr);
+  this.stats.sync++;
   return fr;
 };
 
@@ -4667,6 +4592,23 @@ CHR.at = function (kind, anim, dir, t, o) {
   const A = this.models[kind].anims[anim];
   const fi = A.loop === false ? Math.round(clamp(t, 0, 1) * (A.n - 1)) : Math.floor((((t % 1) + 1) % 1) * A.n);
   return this.frame(kind, anim, dir, fi, o);
+};
+
+// background rendering: animation sets are queued and drawn a few ms per frame
+CHR.warm = function (kind, anims, o = {}, dirs = [2, 0, 4, 6], front = false) {
+  const key = kind + '|' + anims.join(',') + '|' + (o.w || '');
+  if (this.warmed.has(key)) return;
+  this.warmed.add(key);
+  const M = this.models[kind], list = [];
+  for (const d of dirs) for (const anim of anims) if (M.anims[anim]) for (let f = 0; f < M.anims[anim].n; f++) list.push([kind, anim, d, f, o]);
+  if (front) this.queue.unshift(...list); else this.queue.push(...list);
+};
+CHR.pump = function (ms) {
+  const t0 = performance.now();
+  while (this.queue.length && performance.now() - t0 < ms) {
+    const q = this.queue.shift();
+    if (!this.cache.has(this.key(q[0], q[1], q[2], q[3], q[4])[1])) this.frame(q[0], q[1], q[2], q[3], q[4]);
+  }
 };
 
 // one-colour copy of a frame (hit flash, hurt tint, cast shade)
@@ -4678,39 +4620,12 @@ function chrSil(cv, col) {
   g.fillRect(0, 0, cv.width, cv.height);
   return c;
 }
-
-// background rendering: animation sets get queued and rendered in slices of a few ms per frame.
-// dirs: render order (the likely facing first); front: ahead of everything queued so far
-CHR.queue = []; CHR.warmed = new Set(); CHR.job = null; CHR.stats.sync = 0;
-CHR.warm = function (kind, anims, o = {}, dirs = [0, 1, 2, 3, 4, 5, 6, 7], front = false) {
-  const key = kind + '|' + anims.join(',') + '|' + (o.w || '') + '|' + dirs.slice().sort().join('');
-  if (this.warmed.has(key)) return;
-  this.warmed.add(key);
-  const M = this.models[kind], list = [];
-  for (const d of dirs) for (const anim of anims) for (let f = 0; f < M.anims[anim].n; f++) list.push([kind, anim, d, f, o]);
-  if (front) this.queue.unshift(...list); else this.queue.push(...list);
-};
-CHR.pump = function (ms) {
-  const t0 = performance.now();
-  while (performance.now() - t0 < ms) {
-    if (!this.job) {
-      const q = this.queue.shift();
-      if (!q) return;
-      const o = q[4], S = this.spec(q[0], q[1], q[2], q[3], o);
-      if (this.cache.has(S.key)) continue;
-      this.job = { key: S.key, it: chrRenderJob(S.M, this.pose(S, o), q[2], (o.k || 1) * (S.M.k || 1), CHR_BUF_BG) };
-    }
-    const J = this.job, r = J.it.next();
-    if (r.done) { this.job = null; this.cache.set(J.key, r.value); }
-  }
-};
-
 CHR.sil = function (fr, which) {
   if (!fr[which]) fr[which] = chrSil(fr.cv, which === 'white' ? '#ffffff' : which === 'red' ? '#ff2a3a' : '#000000');
   return fr[which];
 };
 
-// draw a frame with its anchor at (x, y); fx: flash, red, dark, sink (px pushed into the ground), alpha
+// draw a frame with its anchor at (x, y); fx: flash, red, dark, sink (px pushed into the ground)
 CHR.draw = function (ctx, fr, x, y, fx = {}) {
   const sink = Math.max(0, Math.round(fx.sink || 0));
   const h = fr.h - Math.max(0, sink - (fr.h - fr.ay));
@@ -4728,8 +4643,23 @@ CHR.draw = function (ctx, fr, x, y, fx = {}) {
 // landmark of a frame in world-screen coordinates for an anchor at (x, y)
 CHR.pt = function (fr, name, x, y) { const p = fr.pts[name]; return p ? [x + p[0], y + p[1]] : [x, y - fr.top * 0.6]; };
 
+// dialog portrait: the front view zoomed 3x and cut to head and shoulders
+CHR.portrait = function (kind, anim, f, rows, flags = {}) {
+  const key = 'portrait|' + kind + '|' + anim + '|' + f + '|' + JSON.stringify(flags);
+  let fr = this.cache.get(key);
+  if (!fr) {
+    const full = this.frame(kind, anim, 2, f, { k: 3, v: 'p' + JSON.stringify(flags), f: flags });
+    const h = Math.min(rows, full.h);
+    const [c, g] = makeCanvas(full.w, h);
+    g.drawImage(full.cv, 0, 0);
+    fr = { cv: c, ax: full.ax, ay: full.ay, hires: true };
+    this.cache.set(key, fr);
+  }
+  return fr;
+};
+
 // ---- animation helpers ----------------------------------------------------------
-// piecewise keys [[t, value], ...] with easing per segment (value numbers or arrays)
+// piecewise keys [[t, value], ...] with easing per segment (values: numbers or arrays)
 function chrKey(t, keys, ez = ease.inOutSine) {
   if (t <= keys[0][0]) return keys[0][1];
   for (let i = 1; i < keys.length; i++) {
@@ -4749,519 +4679,371 @@ const chrC = (t, ph = 0) => Math.cos((t + ph) * TAU);
 <script>
 'use strict';
 // ---------------------------------------------------------------------------
-// the Butcher: a hulking brute in a blood-stained apron, bone mask with war
-// paint, green top-knot, spiked iron pauldron, a cleaver (or the bat-wing
-// cleaver, or the fang pike) in the right hand. Model units are pixels
+// the Butcher, drawn after the 2.0.4 sheet: a huge orange hulk with the head
+// sunk into the shoulders, a white hockey mask with red war paint, a green
+// hood with a spiky tuft, meat-hook rings through both shoulders on red
+// straps, a ragged green loincloth, short stumpy legs and the weapon in the
+// right hand (cleaver, bat-wing cleaver or the fang pike)
 // ---------------------------------------------------------------------------
-const chrP = (j, s, at, r, m, g, o = {}) => Object.assign({ j, s, at, r, m, g }, o);
+const CHR_HERO_MATS = (() => {
+  const O = { out: '#26191b' };
+  return {
+    skin: chrMat(chrRamp('#7c2a1e', '#a8402c', '#cf6536', '#ee8a3a', '#fca63f'), Object.assign({ t: [-0.18, 0.22, 0.7] }, O)),
+    hood: chrMat(chrRamp('#121c16', '#1e2e24', '#2f4836', '#43664a', '#5a8460'), O),
+    loin: chrMat(chrRamp('#121915', '#1d2822', '#2c3a32', '#3e5444', '#516a56'), O),
+    bone: chrMat(chrRamp('#5a4a44', '#9a8a7c', '#c3ad9c', '#dbd1c0', '#f2ebdf'), Object.assign({ t: [-0.3, 0.12, 0.62] }, O)),
+    ring: chrMat(chrRamp('#24202a', '#4c4852', '#76727a', '#a29ea6', '#d8d6dc'), O),
+    strap: chrMat(chrRamp('#4e1210', '#7e1e16', '#b02c1c', '#de4626', '#f46a3c'), O),
+    nail: chrMat(chrRamp('#3a2622', '#6e4a3c', '#9a7262', '#c49c86', '#e2c4ae'), O),
+  };
+})();
 
-const CHR_MATS_HERO = {
-  skin: chrMat(chrRamp('#3c1526', '#7f2d2c', '#c3582f', '#ea8a40', '#ffc677')),
-  bone: chrMat(chrRamp('#2e2838', '#6f6a80', '#bdb6c0', '#e9e3dc', '#ffffff'), { band: [0.24, 0.46, 0.74] }),
-  paint: chrMat(chrRamp('#3a0a14', '#7a1420', '#c42a2e', '#e8584a', '#ff9a80')),
-  hair: chrMat(chrRamp('#07070d', '#12121c', '#222236', '#383856', '#5c5c84')),
-  cloth: chrMat(chrRamp('#180a0e', '#371719', '#5a2822', '#823c30', '#a85a44')),
-  leather: chrMat(chrRamp('#1d1216', '#432620', '#73432c', '#a06a40', '#cc9a62')),
-  boot: chrMat(chrRamp('#120c10', '#2a1a1c', '#4a2c26', '#6e4430', '#946a48')),
-  iron: chrMat(chrRamp('#0e0e16', '#262838', '#474d62', '#757e94', '#b0bad0'), { spec: '#eef4ff', specT: 0.93 }),
-  steel: chrMat(chrRamp('#1c2030', '#4a5468', '#8c98ae', '#cdd6e4', '#ffffff'), { spec: '#ffffff', specT: 0.88 }),
-  wood: chrMat(chrRamp('#1a100c', '#43271a', '#71452a', '#9c6a42', '#c8986a')),
-  brass: chrMat(chrRamp('#2a1608', '#6a3e12', '#ae7426', '#e2b04c', '#fff0a0'), { spec: '#fffbe0' }),
-  apron: chrMat(chrRamp('#352a2c', '#77655f', '#b5a596', '#ddd1bf', '#fbf3e3')),
-  blood: chrMat(chrRamp('#240610', '#4e0c18', '#7e1822', '#b02a2c', '#d85a4c')),
-  wraps: chrMat(chrRamp('#211a1c', '#4a403c', '#786c62', '#a29484', '#c8bca8')),
-  hole: chrMat(chrRamp('#07040a', '#0e0812', '#160c1a', '#1e1222', '#281a2c'), { flat: 1, rim: false }),
-  eye: chrMat(chrRamp('#200808', '#7a1410', '#ff4a24', '#ffb060', '#fff2c8'), { flat: 3, rim: false }),
-  teeth: chrMat(chrRamp('#3a3438', '#8a8078', '#d8d0c0', '#f2ecdc', '#ffffff')),
-  mouth: chrMat(chrRamp('#12040a', '#3a0a14', '#6a1420', '#94283a', '#c04a56'), { flat: 1, rim: false }),
-  bat: chrMat(chrRamp('#1a1028', '#3e2460', '#6e3ea0', '#a46ad8', '#e0b8ff'), { spec: '#ffffff', specT: 0.88 }),
-  fang: chrMat(chrRamp('#2c2a22', '#6e6858', '#b4ac94', '#e2dcc4', '#fffcf0'), { spec: '#ffffff' }),
-  vine: chrMat(chrRamp('#0e2414', '#1a4a24', '#2c7a34', '#4ee070', '#b0ffb0')),
-};
+// decal palettes
+const CHR_MASK_PAL = { h: '#1c1214', r: '#cc2e26', R: '#8e1c1a', s: ['bone', 1], S: ['bone', 2] };
+const CHR_HERO_FRONT_MASK = chrD(-8, -9, [
+  '.................',
+  '.................',
+  '..rr.........rr..',
+  '...rrr.....rrr...',
+  '.....rr...rr.....',
+  '.................',
+  '..hhhh.....hhhh..',
+  '.hhhhhh...hhhhhh.',
+  '.hhhhhh...hhhhhh.',
+  '..hhhh..S..hhhh..',
+  '.......SSS.......',
+  '.r.....h.h.....r.',
+  '..r...........r..',
+  '..rr.........rr..',
+  '...r..h.h.h..r...',
+  '.....h.h.h.h.....',
+  '......h.h.h......',
+  '.................',
+  '.................',
+], CHR_MASK_PAL);
+// profile, facing right: the eye hole near the front edge
+const CHR_HERO_SIDE_MASK = chrD(-1, -9, [
+  '.......',
+  '.......',
+  '..rrr..',
+  '....rr.',
+  '.......',
+  '...hhh.',
+  '..hhhhh',
+  '..hhhhh',
+  '...hhh.',
+  '.....SS',
+  '......h',
+  '.r.....',
+  '..r....',
+  '..rr...',
+  '...r.h.',
+  '....h.h',
+  '.....h.',
+  '.......',
+], CHR_MASK_PAL);
+// a meat-hook ring through the shoulder
+const CHR_HERO_RING = (x, y) => chrD(x, y, [
+  '..ooooo..',
+  '.oRRRRRo.',
+  'oRo...oRo',
+  'oRo...oRo',
+  'oro...oro',
+  'oro...oro',
+  '.orrrrro.',
+  '..ooooo..',
+], { o: '#24202a', R: ['ring', 4], r: ['ring', 2] }, { free: true });
+// stitched scars across the back
+const CHR_HERO_STITCH = chrD(-16, -44, [
+  '.............................oo..',
+  '..........................o.oxo..',
+  '........................ooxxo....',
+  '....................o..oxxo.o....',
+  '..................ooxooxo........',
+  '..............o..oxxxo...........',
+  '............ooxooxo.o............',
+  '.........o..oxxxo................',
+  '.......ooxooxo..o................',
+  '....o..oxxxo.....................',
+  '..ooxooxo.o......................',
+  '.oxxxo...........................',
+  '..o.o.................o..........',
+  '.....................oxo.........',
+  '...................o.oxxo........',
+  '..................oxoxo.o........',
+  '.................oxxxo...........',
+  '................o.o.o............',
+], { o: '#3a1410', x: '#a8302a' });
+const CHR_HERO_FINGERS = (x, y) => chrD(x, y, ['.o.o.o', '.o.o.o'], { o: ['skin', 0] });
 
-// --- surface patterns (unit-space hit point x, y, z; camera normal; flags) ---
-const chrHeroPat = {
-  belly(x, y, z) {
-    // apron: a trapezoid widening toward the hem, leather trim, folds, pocket, blood smears and drips
-    const half = 0.5 + (0.52 - y) * 0.12;
-    if (z > 0.12 && Math.abs(x) < half && y > -0.84 && y < 0.56) {
-      if (Math.abs(x) > half - 0.06 || y > 0.5 || y < -0.78) return 'leather';
-      const streak = chrNoise(x * 10 + 4, y * 2.4, 5), sp = chrNoise(x * 16, y * 16, 8);
-      if (y < 0.32 && streak > 0.74) return streak > 0.82 ? { m: 'blood', d: -1 } : 'blood';
-      if (sp > 0.84) return 'blood';
-      if (y < -0.55 && chrNoise(x * 12, 2, 2) > 0.6) return { m: 'blood', d: 1 };
-      if (Math.abs(y + 0.2) < 0.03 && Math.abs(x) < 0.3) return { m: 'apron', d: -1 };
-      if (Math.abs(Math.abs(x) - 0.3) < 0.03 && y < -0.2) return { m: 'apron', d: -1 };
-      return 'apron';
-    }
-    // stitched scar across the exposed left side of the gut
-    const sx = x - 0.66, sy = y - 0.12, u = sx * 0.55 - sy * 0.83, v = sx * 0.83 + sy * 0.55;
-    if (Math.abs(u) < 0.035 && Math.abs(v) < 0.42) return { m: 'blood', i: 1 };
-    if (Math.abs(v) < 0.42 && Math.abs(u) < 0.11 && ((v + 1) * 9) % 1 < 0.22) return { m: 'skin', i: 0 };
-    return 0;
-  },
-  chest(x, y, z) {
-    // apron neck straps; a long stitched scar across the back
-    if (z > -0.1 && Math.abs(Math.abs(x) - 0.36) < 0.075 && y < 0.62) return 'leather';
-    if (z < -0.2) {
-      const u = x * 0.8 + y * 0.6 + 0.1, v = -x * 0.6 + y * 0.8;
-      if (Math.abs(u) < 0.03 && Math.abs(v) < 0.55) return { m: 'blood', i: 1 };
-      if (Math.abs(v) < 0.55 && Math.abs(u) < 0.09 && ((v + 1) * 8) % 1 < 0.22) return { m: 'skin', i: 0 };
-    }
-    return 0;
-  },
-  mask(x, y, z, nx, ny, nz, f) {
-    if (z < 0.05) return 0;
-    for (const s of [-1, 1]) {
-      // slanted eye holes with an ember glow inside
-      const ex = (x - s * 0.36) / 0.25, ey = (y - 0.02 + s * (x - s * 0.36) * 0.35) / 0.17;
-      if (ex * ex + ey * ey < 1) {
-        const gx = (x - s * 0.36) / 0.1, gy = (y - 0.0) / 0.08;
-        return gx * gx + gy * gy < 1 ? 'eye' : 'hole';
-      }
-    }
-    // breathing holes
-    for (const hx of [-0.17, 0, 0.17]) { const dx = x - hx, dy = y + 0.44; if (dx * dx + dy * dy < 0.0042) return 'hole'; }
-    // three claw stripes of red paint over the right eye, a crack on the left
-    if (x < 0.05 && y > -0.35 && y < 0.8) {
-      const u = x + 0.42 * y;
-      for (const c of [-0.68, -0.5, -0.32]) if (Math.abs(u - c) < 0.05) return 'paint';
-    }
-    if (x > 0.45 && Math.abs(y - 0.55 + (x - 0.45) * 1.8) < 0.035) return { m: 'bone', i: 1 };
-    return 0;
-  },
-  jaw(x, y, z, nx, ny, nz, f) {
-    if (z < 0.3) return 0;
-    if (f.mouth) {
-      const ex = x / 0.62, ey = (y - 0.08) / 0.5;
-      if (ex * ex + ey * ey < 1) {
-        if (y > 0.34 && ((x + 1) * 7.5) % 1 < 0.78) return 'teeth';
-        if (y < -0.2 && ((x + 1) * 6) % 1 < 0.7) return { m: 'teeth', d: -1 };
-        return 'mouth';
-      }
-      return 0;
-    }
-    // a grim mouth line, sewn shut at the corners
-    if (Math.abs(y - 0.12 + x * x * 0.25) < 0.07 && Math.abs(x) < 0.5) return { m: 'mouth', i: 1 };
-    if (Math.abs(Math.abs(x) - 0.42) < 0.05 && Math.abs(y - 0.06) < 0.2) return { m: 'skin', i: 0 };
-    return 0;
-  },
-  cloth(x, y, z) {
-    // ragged hem and folds
-    if (y < -0.55 && chrNoise(Math.atan2(z, x) * 5, 1.5, 4) * 0.5 + 0.55 < -y) return 'x';
-    const a = (Math.atan2(z, x) / Math.PI + 1) * 7;
-    if (a % 1 < 0.14) return -1;
-    return 0;
-  },
-  wraps(x, y, z) {
-    const a = Math.atan2(z, x) / TAU;
-    if (((y * 2.6 + a + 4) % 0.42) < 0.08) return -1;
-    if (y < -0.75) return { m: 'wraps', d: -1 };
-    return 0;
-  },
-  wrist(x, y, z) {
-    if (y < -0.35) { const a = Math.atan2(z, x) / TAU; return ((y * 2.5 + a + 4) % 0.45) < 0.08 ? { m: 'wraps', d: -1 } : 'wraps'; }
-    return 0;
-  },
-  boot(x, y, z) {
-    if (y < -0.62) return { m: 'boot', i: 0 };
-    if (z > 0.78 && y > -0.62) return 'iron';            // toe cap
-    if (z > 0.1 && z < 0.55 && Math.abs(x) < 0.25 && ((z * 9) % 1) < 0.3) return 'leather'; // laces
-    return 0;
-  },
-  fist(x, y, z) {
-    // knuckle creases on the front of the fist
-    if (z > 0.45 && y > -0.1 && y < 0.5 && ((x + 1) * 3.4) % 1 < 0.16) return -1;
-    return 0;
-  },
-  bracer(x, y, z) {
-    const a = Math.atan2(z, x);
-    if (Math.abs(y) < 0.35 && ((a / TAU + 1) * 8) % 1 < 0.22) return 'brass';
-    return 0;
-  },
-  pauldron(x, y, z) {
-    if (y < 0.05 && y > -0.35) { const a = (Math.atan2(z, x) / TAU + 1) * 9; if (a % 1 < 0.24 && y > -0.25 && y < -0.05) return 'brass'; }
-    return 0;
-  },
-  cleaver(x, y, z) {
-    // blade box: x thickness, y height (-1 = edge), z length (+1 = tip)
-    const hx = (z - 0.64) / 0.14, hy = (y - 0.48) / 0.18;
-    if (hx * hx + hy * hy < 1) return 'x';
-    if (y < -0.7) return 1;
-    if (y > 0.84) return -1;
-    if (chrNoise(z * 5 + 2, y * 4, 9) > 0.78 && y < 0.2) return { m: 'blood', d: 1 };
-    return 0;
-  },
-  batblade(x, y, z) {
-    // scalloped bat-wing edge
-    if (y < -0.55) { const u = ((z + 1) * 3.2) % 1; if (y < -0.55 - 0.45 * Math.sin(u * Math.PI)) return 'x'; return 1; }
-    if (z > 0.75 && y > 0.55 - (z - 0.75) * 2.2) return 'x';
-    if (Math.abs(y - 0.1) < 0.06 && z > -0.6) return -1;
-    return 0;
-  },
-  handle(x, y, z) {
-    if (Math.abs(y + 0.35) < 0.12 || Math.abs(y - 0.35) < 0.12) { const a = Math.atan2(z, x); if (Math.abs(a - 1.2) < 0.6 || Math.abs(a + 1.9) < 0.6) return 'brass'; }
-    return 0;
-  },
-  shaft(x, y, z) { return ((y + 1) * 14) % 1 < 0.12 ? -1 : 0; },
-};
+function chrHeroViews() {
+  const hoodSpikes = (dx, sc = 1) => chrPoly([[-8, -7], [-6, -13], [-3, -9], [0, -15], [3, -9], [6, -13], [8, -7]].map(([x, y]) => [x * sc + dx, y]), 'hood', { bev: 1.6 });
+  const loinPat = (u, v, lx) => {
+    // ragged hem and dark folds
+    if (v > 0.25 && valueNoise(lx * 0.42 + 3, 1.7, 9) * 1.3 - 0.25 < v - 0.25) return 'x';
+    return ((lx + 60) % 7 < 1.2) ? -1 : 0;
+  };
+  const leg = (n, x, z, dark) => ({
+    n, p: null, at: [x, -12], z,
+    sh: [chrB(0, 6, 7.6, 6.2, 4, 'skin', { pat: () => (dark ? -1 : 0) })],
+    dc: [chrD(-5, 4, ['.o.o.o.o.', '.o.o.o.o.'], { o: ['skin', 0] })],
+  });
+  // a huge arm hanging from the shoulder pivot: upper arm, a heavier forearm, the fist
+  const arm = (n, x, y, sgn, z, opt = {}) => ({
+    n, p: 'body', at: [x, y], z,
+    sh: [
+      chrCap(0, 1, sgn * 5, 17, 10.6, 10.2, 'skin', { pat: () => (opt.dark ? -1 : 0) }),
+      chrE(sgn * 6.5, 25, 7.8, 6.8, 'skin', { pat: () => (opt.dark ? -1 : 0) }),
+    ],
+    dc: opt.fingers ? [CHR_HERO_FINGERS(sgn * 6.5 - 3, 26)] : null,
+  });
+  const weapon = (p, at, r0, z) => ({ n: 'wpn', p, at, r0, z, wpn: '$w', wsc: 1.1 });
+  const strap = (ax, ay, bx, by) => chrCap(ax, ay, bx, by, 2.2, 1.9, 'strap');
+  const front = {
+    parts: [
+      leg('legL', -12, 1), leg('legR', 12, 1),
+      { n: 'body', p: null, at: [0, -12], z: 3, sh: [chrE(0, -22, 26.5, 22.5, 'skin'), chrE(0, -4, 22, 9, 'skin')] },
+      { n: 'loin', p: 'body', at: [0, 0], z: 4, sh: [chrB(0, -0.5, 25, 6, 3, 'loin', { pat: loinPat })] },
+      arm('armR', -20, -34, -1, 5), arm('armL', 20, -34, 1, 5, { fingers: true }),
+      weapon('armR', [-6.5, 25], 116, 6),
+      {
+        n: 'harness', p: 'body', at: [0, 0], z: 7,
+        sh: [strap(-19, -43, -9.5, -31), strap(19, -43, 9.5, -31)],
+        dc: [CHR_HERO_RING(-24, -51), CHR_HERO_RING(15, -51)],
+      },
+      {
+        n: 'head', p: 'body', at: [0, -40], z: 8,
+        sh: [chrE(0, 0, 12, 11, 'hood'), hoodSpikes(0), chrE(0, 3, 8.6, 9.8, 'bone', { g: 1, ln: true })],
+        dc: [Object.assign({}, CHR_HERO_FRONT_MASK, { y: CHR_HERO_FRONT_MASK.y + 3 })],
+      },
+    ],
+    pts: { mouth: ['head', 0, 9], shL: ['harness', 19.5, -47], shR: ['harness', -19.5, -47], hand: ['armR', -6.5, 25], chest: ['body', 0, -24], top: ['head', 0, -15] },
+  };
+  const back = {
+    parts: [
+      leg('legL', 12, 1), leg('legR', -12, 1),
+      weapon('armR', [6.5, 25], 64, 2),
+      { n: 'head', p: 'body', at: [0, -40], z: 2.5, sh: [chrE(0, 0, 12, 11, 'hood'), hoodSpikes(0)] },
+      { n: 'body', p: null, at: [0, -12], z: 3, sh: [chrE(0, -23, 26.5, 23, 'skin'), chrE(0, -4, 22, 9, 'skin')], dc: [CHR_HERO_STITCH] },
+      { n: 'loin', p: 'body', at: [0, 0], z: 4, sh: [chrB(0, -0.5, 25, 6, 3, 'loin', { pat: loinPat })] },
+      arm('armR', 20, -34, 1, 5, { fingers: true }), arm('armL', -20, -34, -1, 5, { fingers: true }),
+      {
+        n: 'harness', p: 'body', at: [0, 0], z: 6,
+        sh: [strap(19, -43, 8, -33), strap(-19, -43, -8, -33)],
+        dc: [CHR_HERO_RING(15, -51), CHR_HERO_RING(-24, -51)],
+      },
+    ],
+    pts: { mouth: ['head', 0, 6], shL: ['harness', -19.5, -47], shR: ['harness', 19.5, -47], hand: ['armR', 6.5, 25], chest: ['body', 0, -24], top: ['head', 0, -15] },
+  };
+  const side = {
+    parts: [
+      arm('armF', -11, -36, 1, 0, { dark: true }),
+      leg('legF', -8, 1, true), leg('legN', 5, 2),
+      { n: 'body', p: null, at: [0, -12], z: 3, sh: [chrE(-6, -24, 24, 25, 'skin', { rot: 18 }), chrE(8, -10, 16, 13, 'skin')] },
+      { n: 'loin', p: 'body', at: [0, 0], z: 4, sh: [chrB(1, -0.5, 20, 6, 3, 'loin', { pat: loinPat })] },
+      {
+        n: 'head', p: 'body', at: [14, -30], z: 9,
+        sh: [chrE(-2, 0, 10.4, 10.6, 'hood'), hoodSpikes(-3, 0.8), chrE(6, 1.6, 4.8, 9.6, 'bone', { g: 1, ln: true })],
+        dc: [Object.assign({}, CHR_HERO_SIDE_MASK, { x: CHR_HERO_SIDE_MASK.x + 4, y: CHR_HERO_SIDE_MASK.y + 1.6 })],
+      },
+      { n: 'harness', p: 'body', at: [0, 0], z: 6, sh: [strap(-5, -46, 7, -37)], dc: [CHR_HERO_RING(-10, -54)] },
+      arm('armN', 1, -33, 1, 7, { fingers: true }),
+      weapon('armN', [6.5, 25], 40, 8),
+    ],
+    pts: { mouth: ['head', 9, 8], shL: ['harness', -6, -50], shR: ['harness', -6, -50], hand: ['armN', 6.5, 25], chest: ['body', 8, -18], top: ['head', 0, -15] },
+  };
+  return { front, back, side };
+}
 
 CHR.models.butcher = {
-  size: [150, 150], anchor: [75, 128],
-  mats: CHR_MATS_HERO,
-  flags: { mouth: 0, w: 'knife' },
-  joints: [
-    { n: 'root', p: null, at: [0, 0, 0] },
-    { n: 'pelvis', p: 'root', at: [0, 32, 0] },
-    { n: 'spine', p: 'pelvis', at: [0, 8, 0] },
-    { n: 'belly', p: 'spine', at: [0, 0, 0] },
-    { n: 'chest', p: 'spine', at: [0, 19, -1] },
-    { n: 'neck', p: 'chest', at: [0, 11.5, 2] },
-    { n: 'head', p: 'neck', at: [0, 4, 3] },
-    { n: 'shL', p: 'chest', at: [25, 4, -2], rest: [0, 0, 0.3] },
-    { n: 'elL', p: 'shL', at: [0, -17, 0], rest: [-0.25, 0, 0] },
-    { n: 'haL', p: 'elL', at: [0, -16, 0] },
-    { n: 'shR', p: 'chest', at: [-25, 4, -2], rest: [0, 0, -0.3] },
-    { n: 'elR', p: 'shR', at: [0, -17, 0], rest: [-0.25, 0, 0] },
-    { n: 'haR', p: 'elR', at: [0, -16, 0] },
-    { n: 'wpn', p: 'haR', at: [0, -2.5, 1] },
-    { n: 'chain', p: 'pelvis', at: [15, 4, -13] },
-    { n: 'hipL', p: 'pelvis', at: [10, -1, 0], rest: [0, 0, 0.05] },
-    { n: 'knL', p: 'hipL', at: [0, -14, 0] },
-    { n: 'ftL', p: 'knL', at: [0, -14, 0] },
-    { n: 'hipR', p: 'pelvis', at: [-10, -1, 0], rest: [0, 0, -0.05] },
-    { n: 'knR', p: 'hipR', at: [0, -14, 0] },
-    { n: 'ftR', p: 'knR', at: [0, -14, 0] },
-  ],
-  parts: [
-    // torso
-    chrP('pelvis', 'ell', [0, 1, 0], [20, 10, 16], 'cloth', 1, { pat: chrHeroPat.cloth }),
-    chrP('pelvis', 'cyl', [0, 8, 1], [21.5, 2.6, 18], 'leather', 1),
-    chrP('belly', 'ell', [0, 7, 7], [23, 21, 19.5], 'skin', 1, { pat: chrHeroPat.belly }),
-    chrP('chest', 'ell', [0, 3, -3], [26, 14.5, 16.5], 'skin', 1, { pat: chrHeroPat.chest }),
-    chrP('chest', 'ell', [0, 8, -8], [18, 9, 12], 'skin', 1),
-    chrP('neck', 'ell', [0, -2, -2], [12, 6.5, 10], 'skin', 1),
-    // head: heavy jaw under a bone mask
-    chrP('head', 'ell', [0, 6.5, -0.5], [10.5, 11, 10], 'skin', 2),
-    chrP('head', 'ell', [0, 1, 4.2], [9, 5.6, 7.6], 'skin', 2, { pat: chrHeroPat.jaw }),
-    chrP('head', 'ell', [0, 8.6, 4], [10.2, 8.6, 8.2], 'bone', 2, { pat: chrHeroPat.mask }),
-    chrP('head', 'ell', [10, 6, -1.5], [2.4, 3.8, 2.2], 'skin', 2),
-    chrP('head', 'ell', [-10, 6, -1.5], [2.4, 3.8, 2.2], 'skin', 2),
-    chrP('head', 'ell', [0, 18, -3.5], [4.8, 5.4, 4.8], 'hair', 2),
-    chrP('head', 'cyl', [0, 14.6, -3.4], [3.4, 1.3, 3.4], 'brass', 2),
-    chrP('head', 'ell', [0, 15.5, -10], [3, 3.2, 6.6], 'hair', 2, { rot: [0.75, 0, 0] }),
-    // left arm (+x) under a spiked iron pauldron
-    chrP('shL', 'rc', [1.5, 0, 0], [9.6, 6.6], 'skin', 3, { b: [0, -16, 0.5] }),
-    chrP('shL', 'ell', [1, -7.5, 2.2], [7, 6.6, 6.2], 'skin', 3),
-    chrP('shL', 'ell', [2.8, 4.6, 0], [11.4, 6.2, 11.4], 'iron', 3, { pat: chrHeroPat.pauldron }),
-    chrP('shL', 'cone', [5.4, 12, -1], [2.4, 4.8, 2.4], 'iron', 3, { rot: [0, 0, -0.45] }),
-    chrP('shL', 'cone', [7.2, 9.4, 6], [2, 3.8, 2], 'iron', 3, { rot: [0.6, 0, -0.7] }),
-    chrP('shL', 'cone', [7.2, 9.4, -7], [2, 3.8, 2], 'iron', 3, { rot: [-0.6, 0, -0.7] }),
-    chrP('elL', 'rc', [0, -0.5, 0.6], [8.4, 5.6], 'skin', 3, { b: [0, -13, 0.6], pat: chrHeroPat.wrist }),
-    chrP('haL', 'ell', [0, -3, 1], [7, 6.6, 7.6], 'skin', 3, { pat: chrHeroPat.fist }),
-    // right arm (-x) with a studded bracer
-    chrP('shR', 'rc', [-1.5, 0, 0], [9.6, 6.6], 'skin', 4, { b: [0, -16, 0.5] }),
-    chrP('shR', 'ell', [-1, -7.5, 2.2], [7, 6.6, 6.2], 'skin', 4),
-    chrP('elR', 'rc', [0, -0.5, 0.6], [8.4, 5.6], 'skin', 4, { b: [0, -13, 0.6] }),
-    chrP('elR', 'cyl', [0, -10.5, 0.6], [7, 3.6, 7], 'leather', 4, { pat: chrHeroPat.bracer }),
-    chrP('haR', 'ell', [0, -3, 1], [7, 6.6, 7.6], 'skin', 4, { pat: chrHeroPat.fist }),
-    // legs: bare thighs, wrapped shins, iron-capped boots
-    chrP('hipL', 'rc', [0, 0, 0], [10, 7.6], 'skin', 5, { b: [0, -13.5, 0] }),
-    chrP('knL', 'rc', [0, 0, 0], [7.6, 5.6], 'wraps', 5, { b: [0, -12, 0.5], pat: chrHeroPat.wraps }),
-    chrP('ftL', 'ell', [0, -3.5, 3], [7.5, 4.5, 10], 'boot', 5, { pat: chrHeroPat.boot }),
-    chrP('hipR', 'rc', [0, 0, 0], [10, 7.6], 'skin', 6, { b: [0, -13.5, 0] }),
-    chrP('knR', 'rc', [0, 0, 0], [7.6, 5.6], 'wraps', 6, { b: [0, -12, 0.5], pat: chrHeroPat.wraps }),
-    chrP('ftR', 'ell', [0, -3.5, 3], [7.5, 4.5, 10], 'boot', 6, { pat: chrHeroPat.boot }),
-    // meat hook on a chain at the left hip
-    chrP('chain', 'ell', [0, -1.5, 0], [1.4, 2.2, 1.0], 'iron', 8),
-    chrP('chain', 'ell', [0, -4.5, 0], [1.0, 2.2, 1.4], 'iron', 8),
-    chrP('chain', 'ell', [0, -7.5, 0], [1.4, 2.2, 1.0], 'iron', 8),
-    chrP('chain', 'rc', [0, -9.5, 0], [1.5, 1.3], 'steel', 8, { b: [0, -16, 0] }),
-    chrP('chain', 'rc', [0, -16, 0], [1.3, 1.2], 'steel', 8, { b: [0, -19.5, 3] }),
-    chrP('chain', 'rc', [0, -19.5, 3], [1.2, 1.0], 'steel', 8, { b: [0, -17.5, 6.5] }),
-    chrP('chain', 'cone', [0, -15.6, 7.4], [1.3, 2.4, 1.3], 'steel', 8, { rot: [-0.5, 0, 0] }),
-    // hand weapon: the cleaver
-    chrP('wpn', 'cyl', [0, 0, 3], [1.8, 5.5, 1.8], 'wood', 7, { rot: [Math.PI / 2, 0, 0], pat: chrHeroPat.handle, if: f => f.w === 'knife' }),
-    chrP('wpn', 'box', [0, -5.4, 15], [0.9, 7.2, 8.6], 'steel', 7, { pat: chrHeroPat.cleaver, if: f => f.w === 'knife' }),
-    // the bat-wing cleaver
-    chrP('wpn', 'cyl', [0, 0, 3], [1.8, 5.5, 1.8], 'leather', 7, { rot: [Math.PI / 2, 0, 0], if: f => f.w === 'minisaw' }),
-    chrP('wpn', 'box', [0, -6, 16], [1, 8, 10], 'bat', 7, { pat: chrHeroPat.batblade, if: f => f.w === 'minisaw' }),
-    chrP('wpn', 'ell', [0, 1.5, 7.5], [1.6, 2.2, 1.6], 'eye', 7, { if: f => f.w === 'minisaw' }),
-    // the fang pike
-    chrP('wpn', 'cyl', [0, 0, 8], [1.5, 30, 1.5], 'wood', 7, { rot: [Math.PI / 2, 0, 0], pat: chrHeroPat.shaft, if: f => f.w === 'pike' }),
-    chrP('wpn', 'cyl', [0, 0, 36], [2.2, 3, 2.2], 'vine', 7, { rot: [Math.PI / 2, 0, 0], if: f => f.w === 'pike' }),
-    chrP('wpn', 'cone', [0, 0, 45.5], [2.9, 7, 2.9], 'fang', 7, { rot: [Math.PI / 2, 0, 0], if: f => f.w === 'pike' }),
-  ],
-  pts: {
-    mouth: ['head', [0, 0.5, 9.5]],
-    shL: ['shL', [3, 6, 0]],
-    shR: ['shR', [-3, 6, 0]],
-    hand: ['haR', [0, -3, 2]],
-    chest: ['chest', [0, 3, 14]],
-    top: ['head', [0, 16, 0]],
-  },
+  size: [140, 120], anchor: [70, 96],
+  mats: CHR_HERO_MATS,
+  flags: { w: 'knife' },
+  views: chrHeroViews(),
   anims: {},
 };
 
-// --- animations ---------------------------------------------------------------------
+// ---- animations ----------------------------------------------------------------------
 const chrHeroAnims = CHR.models.butcher.anims;
+// arm rest angles: the weapon arm (armR / armN) a little forward, the free arm relaxed
+const chrHeroRest = (P, b = 0) => {
+  const sg = P.view === 'back' ? -1 : 1;
+  P.r.armR = sg * (6 + b); P.r.armL = sg * (-6 - b);
+  P.r.armN = -10 + b; P.r.armF = 4 - b;
+};
 
 chrHeroAnims.idle = {
   n: 8,
   fn(t, P) {
-    const b = chrS(t), b2 = chrS(t, 0.15);
-    P.o.chest = [0, 0.7 * b, 0];
-    P.o.belly = [0, -0.5 * b2, 0.7 * b2];
-    P.o.head = [0, 0.4 * b, 0];
-    P.j.head = [0.04 * b2, 0, 0];
-    P.j.shL = [0.04 * b, 0, 0.05 * b];
-    P.j.shR = [-0.06 + 0.03 * b, 0, -0.04 * b];
-    P.j.elL = [-0.15 - 0.04 * b, 0, 0];
-    P.j.elR = [-0.55 - 0.05 * b, 0, 0];
-    P.j.haR = [0.12 * b2, 0, 0];
-    P.j.chain = [0.06 * chrS(t, 0.3), 0, 0.05 * b];
-    P.j.knL = [0.06, 0, 0]; P.j.knR = [0.06, 0, 0];
-    P.j.hipL = [-0.06, 0, 0]; P.j.hipR = [-0.06, 0, 0];
-    P.t = [0, -0.5 + 0.4 * b, 0];
+    const b = chrS(t), d = b > 0.2 ? 1 : 0;
+    chrHeroRest(P, 2 * b);
+    P.s.body = [1 - 0.012 * b, 1 + 0.02 * b];
+    P.o.head = [0, d * 0.8];
+    P.o.loin = [0, d * 0.4];
+    P.o.harness = [0, d * 0.4];
   },
 };
 
 chrHeroAnims.walk = {
   n: 8,
   fn(t, P) {
-    const c = chrC(t), s = chrS(t);
-    const sw = Math.max(0, -s), sr = Math.max(0, s);
-    P.j.hipL = [-0.5 * c - 0.05, 0, 0];
-    P.j.hipR = [0.5 * c - 0.05, 0, 0];
-    P.j.knL = [1.05 * sw + 0.08, 0, 0];
-    P.j.knR = [1.05 * sr + 0.08, 0, 0];
-    P.j.ftL = [-(P.j.hipL[0] + P.j.knL[0]) * 0.75, 0, 0];
-    P.j.ftR = [-(P.j.hipR[0] + P.j.knR[0]) * 0.75, 0, 0];
-    P.t = [0.6 * s, 1.8 * (Math.abs(s) - 0.65), 0];
-    P.j.pelvis = [0, 0.11 * c, 0.05 * s];
-    P.j.spine = [0.12, -0.15 * c, -0.03 * s];
-    P.j.chest = [0, -0.07 * c, 0];
-    P.j.head = [-0.08 + 0.04 * chrS(t * 2, 0.1), 0.12 * c, 0];
-    P.o.belly = [0, -1.3 * chrS(t * 2, -0.12), 0.5 * chrS(t * 2, -0.1)];
-    P.j.shL = [0.48 * c, 0, 0.05];
-    P.j.shR = [-0.32 * c - 0.06, 0, -0.05];
-    P.j.elL = [-0.3 - 0.35 * Math.max(0, -c), 0, 0];
-    P.j.elR = [-0.6 - 0.25 * Math.max(0, c), 0, 0];
-    P.j.haR = [0.1 * c, 0, 0];
-    P.j.chain = [0.3 * chrS(t, -0.15), 0, 0.12 * chrC(t * 2, -0.1)];
+    const s = chrS(t), c = chrC(t);
+    chrHeroRest(P);
+    if (P.view === 'side') {
+      P.r.legN = -22 * s; P.r.legF = 22 * s;
+      P.r.armN = -10 + 14 * s; P.r.armF = 4 - 14 * s;
+      P.r.body = 4 + 2 * Math.abs(s);
+      P.root.y = Math.abs(s) > 0.6 ? -1 : 0;
+    } else {
+      const a = Math.max(0, s), b = Math.max(0, -s);
+      P.o.legL = [0, -2.4 * a]; P.o.legR = [0, -2.4 * b];
+      P.root.x = 1.2 * s; P.r.body = -3 * s;
+      P.root.y = Math.abs(s) > 0.6 ? -1 : 0;
+      const sg = P.view === 'back' ? -1 : 1;
+      P.r.armR += sg * 6 * s; P.r.armL += sg * 6 * s;
+      P.o.armR = [0, -1.5 * s]; P.o.armL = [0, 1.5 * s];
+    }
+    P.o.head = [0, Math.abs(c) > 0.7 ? 1 : 0];
   },
 };
 
-// pose helpers: K(t, keys) per channel; keys [[t, value], ...]
-const chrHK = chrKey;
-const CHR_PI2 = Math.PI / 2;
+// in-hand swings: wind-up to ~0.3, the hit at 0.45 (cut) / 0.42 (smash) / 0.33 (stab)
+function chrHeroSwing(t, P, kind) {
+  const K = keys => chrKey(t, keys), sg = P.view === 'back' ? -1 : 1;
+  chrHeroRest(P);
+  if (P.view === 'side') {
+    // the raised near arm passes in front of the head
+    if (t > 0.08 && t < 0.85) { P.z.armN = 3; P.z.wpn = 3; }
+    if (kind === 'cutA' || kind === 'cutB') {
+      P.r.armN = K([[0, -10], [0.3, 150, ease.outCubic], [0.45, -62, ease.inQuad], [0.62, -54], [1, -10]]);
+      P.r.body = K([[0, 0], [0.3, -10], [0.45, 12, ease.inQuad], [0.62, 10], [1, 0]]);
+      P.root.x = K([[0, 0], [0.3, -2], [0.45, 4], [1, 0]]);
+      P.r.armF = K([[0, 4], [0.3, -24], [0.45, 30], [1, 4]]);
+    } else if (kind === 'smash') {
+      P.r.armN = K([[0, -10], [0.28, 175, ease.outCubic], [0.42, -40, ease.inQuad], [0.6, -36], [1, -10]]);
+      P.r.armF = K([[0, 4], [0.28, 170, ease.outCubic], [0.42, -30, ease.inQuad], [1, 4]]);
+      P.r.body = K([[0, 0], [0.28, -12], [0.42, 16, ease.inQuad], [0.6, 14], [1, 0]]);
+      P.root.sy = K([[0, 1], [0.28, 1.06], [0.42, 0.88], [0.6, 0.94], [1, 1]]);
+      P.root.sx = K([[0, 1], [0.28, 0.96], [0.42, 1.1], [0.6, 1.04], [1, 1]]);
+    } else {
+      P.r.armN = K([[0, -10], [0.2, 40, ease.outCubic], [0.33, -88, ease.inQuad], [0.55, -84], [1, -10]]);
+      P.o.armN = K([[0, [0, 0]], [0.2, [-4, 0]], [0.33, [6, 0]], [1, [0, 0]]]);
+      P.r.body = K([[0, 0], [0.2, -8], [0.33, 10], [1, 0]]);
+      P.root.x = K([[0, 0], [0.2, -2], [0.33, 4], [1, 0]]);
+    }
+    return;
+  }
+  if (kind === 'cutA') {
+    // forehand: the weapon arm goes up and out, then chops down across the belly
+    P.r.armR = sg * K([[0, 6], [0.3, 150, ease.outCubic], [0.45, -46, ease.inQuad], [0.62, -40], [1, 6]]);
+    P.o.armR = K([[0, [0, 0]], [0.3, [-sg * 2, -3]], [0.45, [sg * 5, 2]], [1, [0, 0]]]);
+    P.r.body = sg * K([[0, 0], [0.3, -7], [0.45, 8, ease.inQuad], [0.62, 7], [1, 0]]);
+    P.r.armL = sg * K([[0, -6], [0.3, -18], [0.45, 4], [1, -6]]);
+  } else if (kind === 'cutB') {
+    // backhand: wound across the body, then flung out to the weapon side
+    P.r.armR = sg * K([[0, 6], [0.3, -70, ease.outCubic], [0.45, 96, ease.inQuad], [0.62, 90], [1, 6]]);
+    P.o.armR = K([[0, [0, 0]], [0.3, [sg * 5, -1]], [0.45, [-sg * 3, -2]], [1, [0, 0]]]);
+    P.r.body = sg * K([[0, 0], [0.3, 7], [0.45, -8, ease.inQuad], [0.62, -7], [1, 0]]);
+    P.r.armL = sg * K([[0, -6], [0.3, 4], [0.45, -18], [1, -6]]);
+  } else if (kind === 'smash') {
+    // overhead slam with both arms
+    P.r.armR = sg * K([[0, 6], [0.28, 170, ease.outCubic], [0.42, 14, ease.inQuad], [0.6, 18], [1, 6]]);
+    P.r.armL = sg * K([[0, -6], [0.28, -170, ease.outCubic], [0.42, -14, ease.inQuad], [0.6, -18], [1, -6]]);
+    P.o.armR = P.o.armL = K([[0, [0, 0]], [0.28, [0, -4]], [0.42, [0, 3]], [1, [0, 0]]]);
+    P.root.sy = K([[0, 1], [0.28, 1.06], [0.42, 0.86], [0.6, 0.94], [1, 1]]);
+    P.root.sx = K([[0, 1], [0.28, 0.96], [0.42, 1.12], [0.6, 1.04], [1, 1]]);
+    P.o.head = K([[0, [0, 0]], [0.28, [0, -2]], [0.42, [0, 3]], [1, [0, 0]]]);
+  } else {
+    // stab: pulled back, then driven down and forward
+    P.r.armR = sg * K([[0, 6], [0.2, 60, ease.outCubic], [0.33, -12, ease.inQuad], [0.55, -8], [1, 6]]);
+    P.o.armR = K([[0, [0, 0]], [0.2, [-sg * 3, -4]], [0.33, [sg * 2, 4]], [1, [0, 0]]]);
+    P.root.y = K([[0, 0], [0.2, -1], [0.33, 2], [1, 0]]);
+  }
+  P.o.head = P.o.head || K([[0, [0, 0]], [0.3, [-sg, -1]], [0.45, [sg, 1]], [1, [0, 0]]]);
+}
+for (const k of ['cutA', 'cutB', 'smash', 'stab']) chrHeroAnims[k] = { n: 16, loop: false, fn: (t, P) => chrHeroSwing(t, P, k) };
 
-// in-hand swing: the right hand sweeps around at shoulder height (forehand), hit at 0.45
-chrHeroAnims.cutA = {
-  n: 16, loop: false,
-  fn(t, P) {
-    const K = keys => chrHK(t, keys);
-    P.j.spine = [K([[0, 0.06], [0.3, -0.06], [0.45, 0.2], [0.6, 0.22], [1, 0.06]]), K([[0, 0], [0.3, -0.55], [0.45, 0.18], [0.6, 0.32], [1, 0]]), 0];
-    P.j.chest = [0, K([[0, 0], [0.3, -0.3], [0.45, 0.1], [0.6, 0.18], [1, 0]]), K([[0, 0], [0.3, 0.06], [0.45, -0.05], [1, 0]])];
-    P.j.head = [K([[0, 0], [0.3, 0.05], [0.45, 0.1], [1, 0]]), -0.7 * (P.j.spine[1] + P.j.chest[1]), 0];
-    P.j.shR = [K([[0, -0.2], [0.3, 0.2], [0.45, 0], [1, -0.2]]), K([[0, 0], [0.3, -0.35], [0.38, 0.5], [0.45, 1.3], [0.6, 1.75], [1, 0]]), K([[0, -0.1], [0.3, -1.0], [0.45, -1.4], [0.6, -1.25], [1, -0.1]])];
-    P.j.elR = [K([[0, -0.6], [0.3, -0.5], [0.45, -0.15], [0.6, -0.6], [1, -0.6]]), 0, K([[0, 0], [0.3, -1.5], [0.4, -0.5], [0.45, -0.1], [1, 0]])];
-    P.j.wpn = [K([[0, 0], [0.25, CHR_PI2], [0.8, CHR_PI2], [1, 0]]), 0, K([[0, 0], [0.25, Math.PI], [0.8, Math.PI], [1, 0]])];
-    P.j.shL = [K([[0, 0], [0.3, -0.7], [0.45, 0.45], [0.6, 0.5], [1, 0]]), 0, K([[0, 0.05], [0.3, 0.45], [0.45, 0.3], [1, 0.05]])];
-    P.j.elL = [K([[0, -0.3], [0.3, -0.8], [0.45, -0.5], [1, -0.3]]), 0, 0];
-    P.t = K([[0, [0, 0, 0]], [0.3, [0, -2.5, -2]], [0.45, [0, -3.5, 5]], [0.6, [0, -3, 6]], [1, [0, 0, 0]]]);
-    P.j.hipL = [K([[0, 0], [0.3, 0.2], [0.45, -0.5], [0.6, -0.5], [1, 0]]), 0, 0];
-    P.j.knL = [K([[0, 0.05], [0.3, 0.4], [0.45, 0.35], [1, 0.05]]), 0, 0];
-    P.j.hipR = [K([[0, 0], [0.3, -0.1], [0.45, 0.35], [0.6, 0.35], [1, 0]]), 0, 0];
-    P.j.knR = [K([[0, 0.05], [0.3, 0.35], [0.45, 0.3], [1, 0.05]]), 0, 0];
-    P.j.ftL = [-(P.j.hipL[0] + P.j.knL[0]) * 0.8, 0, 0];
-    P.j.ftR = [-(P.j.hipR[0] + P.j.knR[0]) * 0.8, 0, 0];
-    P.o.belly = K([[0, [0, 0, 0]], [0.32, [0, 1, -0.5]], [0.5, [0, -1.6, 1.2]], [0.7, [0, 0.6, -0.4]], [1, [0, 0, 0]]]);
-    P.j.chain = [K([[0, 0], [0.45, -0.4], [0.7, 0.3], [1, 0]]), 0, 0];
-  },
-};
-
-// backhand: wound up across the body, sweeps out to the right side
-chrHeroAnims.cutB = {
-  n: 16, loop: false,
-  fn(t, P) {
-    const K = keys => chrHK(t, keys);
-    P.j.spine = [K([[0, 0.06], [0.3, 0.02], [0.45, 0.18], [0.6, 0.2], [1, 0.06]]), K([[0, 0], [0.3, 0.5], [0.45, -0.15], [0.6, -0.35], [1, 0]]), 0];
-    P.j.chest = [0, K([[0, 0], [0.3, 0.3], [0.45, -0.08], [0.6, -0.2], [1, 0]]), 0];
-    P.j.head = [K([[0, 0], [0.45, 0.1], [1, 0]]), -0.7 * (P.j.spine[1] + P.j.chest[1]), 0];
-    P.j.shR = [K([[0, -0.2], [0.3, -0.3], [0.45, 0], [1, -0.2]]), K([[0, 0], [0.3, 1.9], [0.38, 1.75], [0.45, 1.45], [0.6, 0.6], [1, 0]]), K([[0, -0.1], [0.3, -1.1], [0.45, -1.45], [0.6, -1.3], [1, -0.1]])];
-    P.j.elR = [K([[0, -0.6], [0.3, -0.6], [0.45, -0.15], [0.6, -0.45], [1, -0.6]]), 0, K([[0, 0], [0.3, -1.4], [0.4, -0.5], [0.45, -0.1], [1, 0]])];
-    P.j.wpn = [K([[0, 0], [0.25, CHR_PI2], [0.8, CHR_PI2], [1, 0]]), 0, 0];
-    P.j.shL = [K([[0, 0], [0.3, 0.4], [0.45, -0.5], [0.6, -0.55], [1, 0]]), 0, K([[0, 0.05], [0.3, 0.3], [0.45, 0.4], [1, 0.05]])];
-    P.j.elL = [K([[0, -0.3], [0.45, -0.7], [1, -0.3]]), 0, 0];
-    P.t = K([[0, [0, 0, 0]], [0.3, [0, -2.5, -1]], [0.45, [0, -3.5, 4]], [0.6, [0, -3, 5]], [1, [0, 0, 0]]]);
-    P.j.hipR = [K([[0, 0], [0.3, 0.15], [0.45, -0.45], [0.6, -0.45], [1, 0]]), 0, 0];
-    P.j.knR = [K([[0, 0.05], [0.3, 0.35], [0.45, 0.3], [1, 0.05]]), 0, 0];
-    P.j.hipL = [K([[0, 0], [0.45, 0.3], [1, 0]]), 0, 0];
-    P.j.knL = [K([[0, 0.05], [0.3, 0.3], [0.45, 0.3], [1, 0.05]]), 0, 0];
-    P.j.ftL = [-(P.j.hipL[0] + P.j.knL[0]) * 0.8, 0, 0];
-    P.j.ftR = [-(P.j.hipR[0] + P.j.knR[0]) * 0.8, 0, 0];
-    P.o.belly = K([[0, [0, 0, 0]], [0.32, [0, 1, -0.5]], [0.5, [0, -1.6, 1.2]], [0.7, [0, 0.6, -0.4]], [1, [0, 0, 0]]]);
-    P.j.chain = [K([[0, 0], [0.45, 0.4], [0.7, -0.3], [1, 0]]), 0, 0];
-  },
-};
-
-// overhead slam, hit at 0.42
-chrHeroAnims.smash = {
-  n: 16, loop: false,
-  fn(t, P) {
-    const K = keys => chrHK(t, keys);
-    P.j.spine = [K([[0, 0.05], [0.28, -0.25], [0.42, 0.5], [0.6, 0.45], [1, 0.05]]), K([[0, 0], [0.28, -0.15], [0.42, 0.05], [1, 0]]), 0];
-    P.j.chest = [K([[0, 0], [0.28, -0.1], [0.42, 0.15], [1, 0]]), 0, 0];
-    P.j.head = [K([[0, 0], [0.28, -0.35], [0.42, 0.15], [0.6, 0.1], [1, 0]]), 0, 0];
-    P.j.shR = [K([[0, -0.2], [0.28, -2.8], [0.42, -0.85], [0.6, -0.75], [1, -0.2]]), 0, K([[0, -0.1], [0.28, -0.35], [0.42, -0.1], [1, -0.1]])];
-    P.j.elR = [K([[0, -0.6], [0.28, -1.7], [0.42, -0.15], [0.6, -0.3], [1, -0.6]]), 0, 0];
-    P.j.wpn = [K([[0, 0], [0.2, CHR_PI2], [0.8, CHR_PI2], [1, 0]]), 0, 0];
-    P.j.shL = [K([[0, 0], [0.28, -0.9], [0.42, -0.2], [1, 0]]), 0, K([[0, 0.05], [0.28, 0.7], [0.42, 0.5], [1, 0.05]])];
-    P.j.elL = [K([[0, -0.3], [0.28, -1.0], [0.42, -0.4], [1, -0.3]]), 0, 0];
-    P.t = K([[0, [0, 0, 0]], [0.28, [0, 1.5, -2]], [0.42, [0, -6, 4]], [0.6, [0, -5, 4]], [1, [0, 0, 0]]]);
-    P.s = K([[0, [1, 1]], [0.28, [0.97, 1.04]], [0.42, [1.07, 0.92]], [0.55, [1.02, 0.98]], [1, [1, 1]]]);
-    P.j.hipL = [K([[0, 0], [0.28, 0.05], [0.42, -0.55], [0.6, -0.5], [1, 0]]), 0, 0];
-    P.j.knL = [K([[0, 0.05], [0.28, 0.1], [0.42, 0.75], [0.6, 0.7], [1, 0.05]]), 0, 0];
-    P.j.hipR = [K([[0, 0], [0.28, 0.1], [0.42, -0.15], [1, 0]]), 0, 0];
-    P.j.knR = [K([[0, 0.05], [0.28, 0.1], [0.42, 0.55], [0.6, 0.5], [1, 0.05]]), 0, 0];
-    P.j.ftL = [-(P.j.hipL[0] + P.j.knL[0]) * 0.85, 0, 0];
-    P.j.ftR = [-(P.j.hipR[0] + P.j.knR[0]) * 0.85, 0, 0];
-    P.o.belly = K([[0, [0, 0, 0]], [0.28, [0, 1.2, -0.5]], [0.45, [0, -2.2, 1.6]], [0.65, [0, 0.8, -0.4]], [1, [0, 0, 0]]]);
-    P.f.mouth = t > 0.3 && t < 0.62 ? 1 : 0;
-  },
-};
-
-// two-handed-style thrust with the pike, hit at 0.33
-chrHeroAnims.stab = {
-  n: 16, loop: false,
-  fn(t, P) {
-    const K = keys => chrHK(t, keys);
-    P.j.spine = [K([[0, 0.05], [0.2, -0.05], [0.33, 0.25], [0.5, 0.22], [1, 0.05]]), K([[0, 0], [0.2, -0.4], [0.33, 0.3], [0.5, 0.25], [1, 0]]), 0];
-    P.j.chest = [0, K([[0, 0], [0.2, -0.2], [0.33, 0.15], [1, 0]]), 0];
-    P.j.head = [0, -0.5 * (P.j.spine[1] + P.j.chest[1]), 0];
-    P.j.shR = [K([[0, -0.2], [0.2, 0.45], [0.33, -1.35], [0.5, -1.25], [1, -0.2]]), K([[0, 0], [0.33, 0.25], [1, 0]]), K([[0, -0.1], [0.2, -0.35], [0.33, -0.15], [1, -0.1]])];
-    P.j.elR = [K([[0, -0.6], [0.2, -1.6], [0.33, -0.05], [0.5, -0.2], [1, -0.6]]), 0, 0];
-    P.j.wpn = [K([[0, 0], [0.15, CHR_PI2], [0.85, CHR_PI2], [1, 0]]), 0, 0];
-    P.j.shL = [K([[0, 0], [0.2, -0.5], [0.33, 0.5], [1, 0]]), 0, K([[0, 0.05], [0.33, 0.35], [1, 0.05]])];
-    P.j.elL = [K([[0, -0.3], [0.2, -0.9], [0.33, -0.4], [1, -0.3]]), 0, 0];
-    P.t = K([[0, [0, 0, 0]], [0.2, [0, -2, -4]], [0.33, [0, -3, 8]], [0.5, [0, -3, 8]], [1, [0, 0, 0]]]);
-    P.j.hipL = [K([[0, 0], [0.2, 0.2], [0.33, -0.6], [0.5, -0.6], [1, 0]]), 0, 0];
-    P.j.knL = [K([[0, 0.05], [0.2, 0.4], [0.33, 0.3], [1, 0.05]]), 0, 0];
-    P.j.hipR = [K([[0, 0], [0.33, 0.45], [0.5, 0.45], [1, 0]]), 0, 0];
-    P.j.knR = [K([[0, 0.05], [0.2, 0.3], [0.33, 0.15], [1, 0.05]]), 0, 0];
-    P.j.ftL = [-(P.j.hipL[0] + P.j.knL[0]) * 0.8, 0, 0];
-    P.j.ftR = [-(P.j.hipR[0] + P.j.knR[0]) * 0.8, 0, 0];
-    P.o.belly = K([[0, [0, 0, 0]], [0.22, [0, 0.8, -0.5]], [0.4, [0, -1.4, 1.2]], [0.6, [0, 0.5, -0.3]], [1, [0, 0, 0]]]);
-  },
-};
-
-// death: stagger back, drop to the knees, slump forward (t 0..1 = 0..0.9 s)
+// death: stagger back, the knees give, the body slumps (0.9 s)
 chrHeroAnims.die = {
   n: 10, loop: false,
   fn(t, P) {
-    const K = keys => chrHK(t, keys);
-    P.j.spine = [K([[0, 0], [0.16, -0.32], [0.5, 0.1], [1, 0.55]]), K([[0, 0], [0.16, 0.15], [1, 0.08]]), 0];
-    P.j.chest = [K([[0, 0], [0.16, -0.1], [1, 0.2]]), 0, 0];
-    P.j.head = [K([[0, 0], [0.16, -0.5], [0.5, 0.1], [1, 0.75]]), K([[0, 0], [1, 0.2]]), 0];
-    P.j.shL = [K([[0, 0], [0.16, -0.4], [0.6, 0.1], [1, -0.15]]), 0, K([[0, 0.05], [0.16, 0.9], [0.6, 0.25], [1, 0.12]])];
-    P.j.shR = [K([[0, -0.2], [0.16, -0.5], [0.6, 0.1], [1, -0.1]]), 0, K([[0, -0.1], [0.16, -0.9], [0.6, -0.25], [1, -0.12]])];
-    P.j.elL = [K([[0, -0.3], [0.16, -0.9], [1, -0.15]]), 0, 0];
-    P.j.elR = [K([[0, -0.6], [0.16, -1.1], [1, -0.2]]), 0, 0];
-    P.t = K([[0, [0, 0, 0]], [0.16, [0, 1, -4]], [0.55, [0, -15, -3]], [0.7, [0, -14, -2]], [1, [0, -15.5, -1]]]);
-    P.s = K([[0, [1, 1]], [0.55, [1, 1]], [0.62, [1.06, 0.93]], [0.75, [1, 1]], [1, [1, 1]]]);
-    P.j.hipL = [K([[0, 0], [0.16, 0.1], [0.55, -0.15], [1, -0.1]]), 0, 0];
-    P.j.hipR = [K([[0, 0], [0.16, 0.05], [0.55, -0.1], [1, -0.05]]), 0, 0];
-    P.j.knL = [K([[0, 0.05], [0.16, 0.25], [0.55, 1.65], [1, 1.6]]), 0, 0];
-    P.j.knR = [K([[0, 0.05], [0.16, 0.2], [0.55, 1.6], [1, 1.6]]), 0, 0];
-    P.j.ftL = [K([[0, 0], [0.55, -0.1], [1, 0]]), 0, 0];
-    P.j.ftR = [K([[0, 0], [0.55, -0.1], [1, 0]]), 0, 0];
-    P.o.belly = K([[0, [0, 0, 0]], [0.18, [0, 1, 0]], [0.6, [0, -2.2, 1.5]], [0.75, [0, 0.6, 0]], [1, [0, -0.6, 0.6]]]);
-    P.j.chain = [K([[0, 0], [0.6, 0.5], [0.8, -0.3], [1, 0]]), 0, 0];
+    const K = keys => chrKey(t, keys), sg = P.view === 'back' ? -1 : 1;
+    chrHeroRest(P);
+    P.root.y = K([[0, 0], [0.16, -2], [0.55, 9], [0.7, 8], [1, 9]]);
+    P.root.sy = K([[0, 1], [0.55, 0.9], [0.65, 0.94], [1, 0.92]]);
+    P.root.sx = K([[0, 1], [0.55, 1.08], [1, 1.06]]);
+    if (P.view === 'side') {
+      P.r.body = K([[0, 0], [0.16, -12], [0.55, 6], [1, 22]]);
+      P.r.armN = K([[0, -10], [0.16, 40], [1, -20]]); P.r.armF = K([[0, 4], [0.16, 30], [1, -10]]);
+      P.r.legN = K([[0, 0], [0.55, -30], [1, -30]]); P.r.legF = K([[0, 0], [0.55, -24], [1, -26]]);
+    } else {
+      P.r.body = sg * K([[0, 0], [0.16, -6], [0.55, 4], [1, 7]]);
+      P.r.armR = sg * K([[0, 6], [0.16, 40], [1, 14]]); P.r.armL = sg * K([[0, -6], [0.16, -40], [1, -16]]);
+      P.o.head = K([[0, [0, 0]], [0.16, [0, -3]], [1, [0, 4]]]);
+      P.s.legL = P.s.legR = K([[0, [1, 1]], [0.55, [1.15, 0.55]], [1, [1.15, 0.5]]]);
+    }
     P.f.w = t > 0.82 ? '' : P.f.w;
   },
 };
 
-// in the air: tucked while rising (the frame is spun by the game), spread while falling
+// in the air: curled up while rising (the game spins the frame), spread while falling
 chrHeroAnims.tuck = {
   n: 2,
   fn(t, P) {
-    P.j.spine = [0.4, 0, 0];
-    P.j.head = [0.3, 0, 0];
-    P.j.hipL = [-1.3, 0, 0.15]; P.j.hipR = [-1.3, 0, -0.15];
-    P.j.knL = [1.9, 0, 0]; P.j.knR = [1.9, 0, 0];
-    P.j.shL = [-0.9 + 0.1 * chrS(t), 0, 0.4]; P.j.shR = [-0.9, 0, -0.4];
-    P.j.elL = [-1.6, 0, 0]; P.j.elR = [-1.6, 0, 0];
-    P.t = [0, 10, 0];
+    const sg = P.view === 'back' ? -1 : 1;
+    P.r.armR = sg * 120; P.r.armL = -sg * 120; P.r.armN = 120; P.r.armF = 110;
+    P.o.armR = P.o.armL = [0, 4];
+    P.o.legL = P.o.legR = P.o.legN = P.o.legF = [0, -8];
+    P.root.sy = 0.86; P.root.sx = 1.06;
   },
 };
 chrHeroAnims.fall = {
   n: 2,
   fn(t, P) {
-    const b = t < 0.5 ? 0 : 1;
-    P.j.spine = [-0.15, 0, 0];
-    P.j.head = [-0.35, 0, 0];
-    P.j.shL = [-2.4 - 0.15 * b, 0, 0.6]; P.j.shR = [-2.4 - 0.15 * b, 0, -0.6];
-    P.j.elL = [-0.5, 0, 0]; P.j.elR = [-0.7, 0, 0];
-    P.j.hipL = [-0.35, 0, 0.12]; P.j.hipR = [0.15, 0, -0.12];
-    P.j.knL = [0.7, 0, 0]; P.j.knR = [0.4, 0, 0];
-    P.o.belly = [0, 1 + b, 0];
-    P.f.mouth = 1;
+    const sg = P.view === 'back' ? -1 : 1, b = t < 0.5 ? 0 : 6;
+    P.r.armR = sg * (150 + b); P.r.armL = -sg * (150 + b); P.r.armN = 160 + b; P.r.armF = 150 + b;
+    P.o.legL = [0, 2]; P.o.legR = [0, 2 + (b ? 1 : 0)];
+    P.root.sy = 1.06; P.root.sx = 0.96;
+    P.o.head = [0, -2];
   },
 };
 
-// landing: a deep squash, arms flung out, back up (0.5 s)
+// landing: a deep squash, arms flung out, then back up (0.3 s)
 chrHeroAnims.land = {
   n: 6, loop: false,
   fn(t, P) {
-    const K = keys => chrHK(t, keys);
-    P.t = K([[0, [0, -9, 0]], [0.35, [0, -6, 0]], [1, [0, 0, 0]]]);
-    P.s = K([[0, [1.12, 0.84]], [0.3, [1.05, 0.95]], [0.55, [0.98, 1.03]], [1, [1, 1]]]);
-    P.j.spine = [K([[0, 0.45], [1, 0.05]]), 0, 0];
-    P.j.head = [K([[0, 0.35], [0.5, -0.1], [1, 0]]), 0, 0];
-    P.j.hipL = [K([[0, -0.7], [1, -0.05]]), 0, K([[0, 0.25], [1, 0]])];
-    P.j.hipR = [K([[0, -0.7], [1, -0.05]]), 0, K([[0, -0.25], [1, 0]])];
-    P.j.knL = [K([[0, 1.1], [1, 0.06]]), 0, 0];
-    P.j.knR = [K([[0, 1.1], [1, 0.06]]), 0, 0];
-    P.j.ftL = [-(P.j.hipL[0] + P.j.knL[0]) * 0.9, 0, 0];
-    P.j.ftR = [-(P.j.hipR[0] + P.j.knR[0]) * 0.9, 0, 0];
-    P.j.shL = [K([[0, -0.3], [1, 0]]), 0, K([[0, 1.0], [0.5, 0.4], [1, 0.05]])];
-    P.j.shR = [K([[0, -0.3], [1, -0.06]]), 0, K([[0, -1.0], [0.5, -0.4], [1, -0.05]])];
-    P.j.elL = [K([[0, -0.6], [1, -0.15]]), 0, 0];
-    P.j.elR = [K([[0, -0.8], [1, -0.55]]), 0, 0];
-    P.o.belly = K([[0, [0, -2.5, 1.5]], [0.3, [0, 1.2, -0.5]], [0.6, [0, -0.6, 0.3]], [1, [0, 0, 0]]]);
+    const K = keys => chrKey(t, keys), sg = P.view === 'back' ? -1 : 1;
+    P.root.sy = K([[0, 0.76], [0.4, 0.9], [0.7, 1.04], [1, 1]]);
+    P.root.sx = K([[0, 1.2], [0.4, 1.08], [0.7, 0.98], [1, 1]]);
+    P.r.armR = sg * K([[0, 70], [1, 6]]); P.r.armL = -sg * K([[0, 70], [1, 6]]);
+    P.r.armN = K([[0, 60], [1, -10]]); P.r.armF = K([[0, 50], [1, 4]]);
+    P.o.head = K([[0, [0, 3]], [1, [0, 0]]]);
   },
 };
 
-// roar: chest out, head back, arms wide (0.7 s)
+// the battle cry: arms wide and up, chest out, head thrown back (0.75 s)
 chrHeroAnims.roar = {
   n: 8, loop: false,
   fn(t, P) {
-    const K = keys => chrHK(t, keys), shk = t > 0.2 && t < 0.85 ? chrS(t * 6) * 0.03 : 0;
-    P.j.spine = [K([[0, 0.1], [0.2, -0.28], [0.85, -0.25], [1, 0.05]]), shk, 0];
-    P.j.chest = [K([[0, 0], [0.2, -0.12], [1, 0]]), 0, 0];
-    P.j.head = [K([[0, 0.1], [0.2, -0.55], [0.85, -0.5], [1, 0]]), shk * 2, 0];
-    P.j.shL = [K([[0, 0], [0.2, -0.5], [0.85, -0.45], [1, 0]]), 0, K([[0, 0.05], [0.2, 1.25], [0.85, 1.2], [1, 0.05]])];
-    P.j.shR = [K([[0, -0.2], [0.2, -0.5], [0.85, -0.45], [1, -0.2]]), 0, K([[0, -0.1], [0.2, -1.25], [0.85, -1.2], [1, -0.1]])];
-    P.j.elL = [K([[0, -0.3], [0.2, -0.35], [1, -0.3]]), 0, K([[0, 0], [0.2, 1.45], [0.85, 1.35], [1, 0]])];
-    P.j.elR = [K([[0, -0.6], [0.2, -0.35], [1, -0.6]]), 0, K([[0, 0], [0.2, -1.45], [0.85, -1.35], [1, 0]])];
-    P.o.belly = [0, K([[0, 0], [0.2, 1.4], [0.85, 1.2], [1, 0]]), K([[0, 0], [0.2, 1.2], [1, 0]])];
-    P.s = K([[0, [1, 1]], [0.2, [0.98, 1.04]], [0.85, [0.98, 1.03]], [1, [1, 1]]]);
-    P.t = [0, K([[0, 0], [0.2, 1], [0.85, 1], [1, 0]]), 0];
-    P.f.mouth = t > 0.12 && t < 0.9 ? 1 : 0;
+    const K = keys => chrKey(t, keys), sg = P.view === 'back' ? -1 : 1;
+    const up = K([[0, 0], [0.2, 1], [0.85, 1], [1, 0]]), shk = t > 0.2 && t < 0.85 ? (Math.floor(t * 24) % 2 ? 1 : -1) : 0;
+    P.r.armR = sg * (6 + 104 * up); P.r.armL = -sg * (6 + 104 * up);
+    P.r.armN = -10 + 140 * up; P.r.armF = 4 + 120 * up;
+    P.root.sy = 1 + 0.05 * up; P.root.sx = 1 - 0.03 * up;
+    P.o.head = [shk * 0.6, -3 * up];
+    P.r.head = P.view === 'side' ? -14 * up : 0;
   },
 };
 
-// gulp: the hook comes back out of the mouth
+// the gulp: the head jerks back as the hook comes home
 chrHeroAnims.gulp = {
   n: 4, loop: false,
   fn(t, P) {
-    const K = keys => chrHK(t, keys);
-    P.j.head = [K([[0, -0.4], [0.5, -0.2], [1, 0]]), 0, 0];
-    P.j.spine = [K([[0, -0.12], [1, 0.05]]), 0, 0];
-    P.o.belly = [0, K([[0, 1.5], [0.4, -1.2], [1, 0]]), K([[0, 1.5], [0.5, -0.6], [1, 0]])];
-    P.f.mouth = t < 0.7 ? 1 : 0;
-    P.j.elR = [-0.6, 0, 0]; P.j.elL = [-0.3, 0, 0];
+    const K = keys => chrKey(t, keys);
+    chrHeroRest(P);
+    P.o.head = K([[0, [0, -3]], [0.5, [0, -1]], [1, [0, 0]]]);
+    P.s.body = K([[0, [1.04, 0.97]], [0.4, [0.98, 1.03]], [1, [1, 1]]]);
+    if (P.view === 'side') P.r.head = K([[0, -16], [1, 0]]);
   },
 };
 
@@ -5269,826 +5051,964 @@ chrHeroAnims.gulp = {
 <script>
 'use strict';
 // ---------------------------------------------------------------------------
-// enemies and NPCs on a shared humanoid rig: the hooded bandit, the knight,
-// the dark knight, the troll, the tree golem, the cursed girl, the old miner
+// enemies and NPCs drawn after the Butcher Hero 2.0.4 character sheets:
+// the swordsman (cut_cut_easy), the spearman (the knights), the troll (boss),
+// the tree giant (elite), plus the cursed girl and the old miner
 // ---------------------------------------------------------------------------
-const CHR_MATS_COMMON = {
-  skin: chrMat(chrRamp('#3a1c1a', '#7a4234', '#b8705a', '#e0a07c', '#ffd4b0')),
-  steel: chrMat(chrRamp('#1c2030', '#4a5468', '#8c98ae', '#cdd6e4', '#ffffff'), { spec: '#ffffff', specT: 0.9 }),
-  iron: chrMat(chrRamp('#0e0e16', '#262838', '#474d62', '#757e94', '#b0bad0'), { spec: '#eef4ff', specT: 0.93 }),
-  wood: chrMat(chrRamp('#1a100c', '#43271a', '#71452a', '#9c6a42', '#c8986a')),
-  leather: chrMat(chrRamp('#1d1216', '#432620', '#73432c', '#a06a40', '#cc9a62')),
-  boot: chrMat(chrRamp('#120c10', '#2a1a1c', '#4a2c26', '#6e4430', '#946a48')),
-  brass: chrMat(chrRamp('#2a1608', '#6a3e12', '#ae7426', '#e2b04c', '#fff0a0'), { spec: '#fffbe0' }),
-  bone: chrMat(chrRamp('#2e2838', '#6f6a80', '#bdb6c0', '#e9e3dc', '#ffffff')),
-  hole: chrMat(chrRamp('#07040a', '#0e0812', '#160c1a', '#1e1222', '#281a2c'), { flat: 1, rim: false }),
-  white: chrMat(chrRamp('#4a4458', '#9a94a8', '#e8e4f0', '#ffffff', '#ffffff'), { flat: 3, rim: false }),
-  glowR: chrMat(chrRamp('#200808', '#7a1410', '#ff4a24', '#ffb060', '#fff2c8'), { flat: 3, rim: false }),
-  glowY: chrMat(chrRamp('#202008', '#606010', '#d8e040', '#f4ff8a', '#ffffe0'), { flat: 3, rim: false }),
-  stone: chrMat(chrRamp('#24222c', '#4c4a56', '#7c7a86', '#a8a6b0', '#d0ced6')),
-};
-const chrMats = extra => Object.assign({}, CHR_MATS_COMMON, extra);
 
-// joints of a biped; d: proportions in model units (px)
-function chrRig(d) {
-  const J = [
-    { n: 'root', p: null, at: [0, 0, 0] },
-    { n: 'pelvis', p: 'root', at: [0, d.hip, 0] },
-    { n: 'spine', p: 'pelvis', at: [0, d.spine, 0], rest: d.hunch ? [d.hunch, 0, 0] : undefined },
-    { n: 'chest', p: 'spine', at: [0, d.chest, 0] },
-    { n: 'neck', p: 'chest', at: [0, d.neck, d.neckZ || 0] },
-    { n: 'head', p: 'neck', at: [0, d.headY, d.headZ || 0], rest: d.headRest },
-  ];
-  for (const [s, sg] of [['L', 1], ['R', -1]]) {
-    J.push({ n: 'sh' + s, p: 'chest', at: [sg * d.shX, d.shY, d.shZ || 0], rest: [0, 0, sg * (d.armOut || 0.12)] });
-    J.push({ n: 'el' + s, p: 'sh' + s, at: [0, -d.upArm, 0], rest: [d.elbow || -0.15, 0, 0] });
-    J.push({ n: 'ha' + s, p: 'el' + s, at: [0, -d.foreArm, 0] });
+// shared pose helpers for the small bipeds ---------------------------------------
+// legs: front/back views lift the feet in turn, side views swing them about the hips
+function chrLegs(P, view, ph, amt = 1) {
+  const s = Math.sin(ph * TAU), c = Math.cos(ph * TAU);
+  if (view === 'side') {
+    P.r.legN = -26 * s * amt; P.r.legF = 26 * s * amt;
+    return c;
   }
-  for (const [s, sg] of [['L', 1], ['R', -1]]) {
-    J.push({ n: 'hip' + s, p: 'pelvis', at: [sg * d.legX, -1, 0], rest: [0, 0, sg * (d.legOut || 0.04)] });
-    J.push({ n: 'kn' + s, p: 'hip' + s, at: [0, -d.thigh, 0] });
-    J.push({ n: 'ft' + s, p: 'kn' + s, at: [0, -d.shin, 0] });
-  }
-  J.push({ n: 'wpn', p: 'haR', at: [0, -(d.grip || 1.5), 0.4] });
-  J.push({ n: 'off', p: 'haL', at: [0, -(d.grip || 1.5), 0.4] });
-  for (const x of d.extra || []) J.push(x);
-  return J;
+  const a = Math.max(0, s) * amt, b = Math.max(0, -s) * amt;
+  P.o.legL = [0, -1.6 * a]; P.s.legL = [1, 1 - 0.1 * a];
+  P.o.legR = [0, -1.6 * b]; P.s.legR = [1, 1 - 0.1 * b];
+  return c;
 }
 
-// shared animation set; o: gait and attack style
-function chrHumanAnims(o) {
-  const A = {}, st = o.stride || 0.5, kn = o.knee || 1, bob = o.bob || 1, sw = o.armSwing || 0.45;
-  const legs = (P, hl, hr, kl, kr) => {
-    P.j.hipL = [hl, 0, 0]; P.j.hipR = [hr, 0, 0]; P.j.knL = [kl, 0, 0]; P.j.knR = [kr, 0, 0];
-    P.j.ftL = [-(hl + kl) * 0.8, 0, 0]; P.j.ftR = [-(hr + kr) * 0.8, 0, 0];
+// palette entries for the decals
+const CHR_EYE = { B: '#24120c', W: '#fff6ea', P: '#2a160e' };
+
+// ---------------------------------------------------------------------------
+// the swordsman (cut_cut_easy): bowl-cut brown hair, heavy brows, sleeveless
+// leather tunic with a tin pendant, leather bracers, dark trousers, a hatchet
+// ---------------------------------------------------------------------------
+const CHR_SWORD_MATS = (() => {
+  const O = { out: '#170908' };
+  return {
+    skin: chrMat(chrRamp('#7a3c1e', '#b86a40', '#d8834e', '#f6a061', '#fcbd84'), O),
+    hair: chrMat(chrRamp('#160a08', '#2a1816', '#402c24', '#5a3e2c', '#70503a'), O),
+    tunic: chrMat(chrRamp('#3a2214', '#5a3a22', '#7a4e30', '#a76c3e', '#c08550'), O),
+    belt: chrMat(chrRamp('#1e110c', '#2e1c14', '#402c24', '#5a3e2c', '#6c4a34'), O),
+    pants: chrMat(chrRamp('#1c100c', '#2e1c14', '#3e2a20', '#523828', '#664632'), O),
+    boot: chrMat(chrRamp('#100806', '#1a0f0c', '#24160f', '#332218', '#432e22'), O),
+    metal: chrMat(chrRamp('#2e2a2a', '#5c5654', '#86827f', '#b2b2b0', '#e2e4e2'), O),
+    wood: chrMat(chrRamp('#2a160c', '#4a2c18', '#6e4426', '#8e5a34', '#a8703e'), O),
   };
-  A.idle = {
+})();
+
+// the hatchet, grip at the origin, haft along +y, head at the far end
+const chrHatchet = [
+  chrCap(0, -1, 0, 9, 1.05, 1.05, 'wood'),
+  chrPoly([[0.6, 5.4], [4.6, 4.4], [5.6, 7.8], [5, 10.8], [0.6, 9]], 'metal', { bev: 1.4, pat: u => (u > 0.55 ? 1 : 0) }),
+  chrPoly([[-1.3, 6], [0.8, 5.8], [0.8, 8.4], [-1.3, 8.2]], 'metal', { bev: 0 }),
+];
+
+function chrSwordViews() {
+  const leg = (n, x) => ({
+    n, p: null, at: [x, -13], z: 1,
+    sh: [chrB(0, 6.5, 4.5, 6.6, 2.5, 'pants', { pat: (u, v) => (v > 0.48 ? 'boot' : 0) })],
+  });
+  const arm = (n, x, z) => ({
+    n, p: 'torso', at: [x, -12], z,
+    sh: [
+      chrCap(0, 0, 0, 9.6, 3.4, 3.1, 'skin', { pat: u => (u > 0.58 ? 'belt' : 0) }),
+      chrE(0, 12, 3.3, 3.1, 'skin'),
+    ],
+  });
+  const axe = (p, r0, z) => ({ n: 'axe', p, at: [0, 12.5], r0, z, sh: chrHatchet });
+  const pendant = chrD(-1.5, -12, ['.c.', '.c.', 'MMM', 'MmM', 'MMM'], { c: '#2a1810', M: ['metal', 3], m: ['metal', 1] });
+  const buckle = chrD(-2, -4, ['MMMM', 'M..M', 'MMMM'], { M: ['metal', 3] });
+  const front = {
+    parts: [
+      leg('legL', -4.4), leg('legR', 4.4),
+      {
+        n: 'torso', p: null, at: [0, -13], z: 3,
+        sh: [chrB(0, -7.6, 10, 7.6, 4.2, 'tunic', { pat: (u, v) => (v > 0.52 && v < 0.94 ? 'belt' : 0) })],
+        dc: [pendant, buckle, chrD(-4, -15, ['DD.....DD'], { D: ['tunic', 1] })],
+      },
+      arm('armR', -10.6, 4), arm('armL', 10.6, 4),
+      axe('armR', 28, 5),
+      {
+        n: 'head', p: 'torso', at: [0, -13.5], z: 6,
+        sh: [
+          chrB(0, -8, 8.4, 8.2, 4.6, 'skin', { flat: 0.25 }),
+          chrB(0, -14, 9, 3.8, 3.4, 'hair', { g: 1, ln: true }),
+          chrB(-7.7, -9.6, 1.6, 2.8, 1.2, 'hair', { g: 1 }),
+          chrB(7.7, -9.6, 1.6, 2.8, 1.2, 'hair', { g: 1 }),
+        ],
+        dc: [chrD(-6, -9, [
+          '.BBBBB.BBBBB.',
+          '..BBBB.BBBB..',
+          '..PPPP.PPPP..',
+          '..WPPW.WPPW..',
+          '.............',
+          '....MMMMM....',
+          '.....mmm.....',
+        ], Object.assign({ M: ['skin', 1], m: ['skin', 2] }, CHR_EYE))],
+      },
+    ],
+    pts: { top: ['head', 0, -17], hand: ['armR', 0, 12], chest: ['torso', 0, -8] },
+  };
+  const back = {
+    parts: [
+      leg('legL', 4.4), leg('legR', -4.4),
+      {
+        n: 'torso', p: null, at: [0, -13], z: 3,
+        sh: [chrB(0, -7.6, 10, 7.6, 4.2, 'tunic', { pat: (u, v) => (v > 0.52 && v < 0.94 ? 'belt' : 0) })],
+        dc: [chrD(-1, -14, ['D', 'D', 'D', 'D'], { D: ['tunic', 2] })],
+      },
+      arm('armR', 10.6, 4), arm('armL', -10.6, 4),
+      axe('armR', -28, 2),
+      {
+        n: 'head', p: 'torso', at: [0, -13.5], z: 6,
+        sh: [chrB(0, -8, 9, 8.6, 5, 'hair')],
+        dc: [chrD(-6, -3, ['.D.......D.', '..DDDDDDD..'], { D: ['hair', 2] })],
+      },
+    ],
+    pts: { top: ['head', 0, -17], hand: ['armR', 0, 12], chest: ['torso', 0, -8] },
+  };
+  const side = {
+    parts: [
+      { n: 'armF', p: 'torso', at: [-1, -12], z: 0, sh: [chrCap(0, 0, 0, 9.6, 3, 2.8, 'skin', { pat: u => (u > 0.58 ? 'belt' : -1) }), chrE(0, 12, 3, 2.9, 'skin', { pat: () => -1 })] },
+      { n: 'legF', p: null, at: [-1.6, -13], z: 1, sh: [chrB(0, 6.5, 3.6, 6.6, 2.4, 'pants', { pat: (u, v) => (v > 0.48 ? { m: 'boot', d: -1 } : -1) }), chrB(1.6, 12.2, 3.2, 1.2, 1, 'boot', { pat: () => -1 })] },
+      { n: 'legN', p: null, at: [1.4, -13], z: 2, sh: [chrB(0, 6.5, 3.6, 6.6, 2.4, 'pants', { pat: (u, v) => (v > 0.48 ? 'boot' : 0) }), chrB(1.6, 12.2, 3.2, 1.2, 1, 'boot')] },
+      {
+        n: 'torso', p: null, at: [0, -13], z: 3,
+        sh: [chrB(0.2, -7.6, 6.8, 7.6, 3.6, 'tunic', { pat: (u, v) => (v > 0.52 && v < 0.94 ? 'belt' : 0) })],
+        dc: [chrD(4.5, -11, ['c', 'M', 'M'], { c: '#2a1810', M: ['metal', 3] })],
+      },
+      { n: 'armN', p: 'torso', at: [0.6, -12], z: 5, sh: [chrCap(0, 0, 0, 9.6, 3.2, 3, 'skin', { pat: u => (u > 0.58 ? 'belt' : 0) }), chrE(0, 12, 3.2, 3, 'skin')] },
+      { n: 'axe', p: 'armN', at: [0, 12], r0: -100, z: 4, sh: chrHatchet },
+      {
+        n: 'head', p: 'torso', at: [0.6, -13.5], z: 6,
+        sh: [
+          chrB(0.6, -8, 8, 8.2, 4.6, 'skin', { flat: 0.25 }),
+          chrB(-3.6, -9.4, 4.8, 7, 3.6, 'hair', { g: 1, ln: true }),
+          chrB(1.2, -14, 7.4, 3, 2.4, 'hair', { g: 1, ln: true }),
+        ],
+        dc: [chrD(1, -9, ['.ss.', 'sSSs', 'sSs.', '.ss.'], { s: ['skin', 3], S: ['skin', 1] }),
+          chrD(4, -10, ['BBBBB', '..WPP', '...W.', '.....', '.....', '...MM'], Object.assign({ M: ['skin', 1] }, CHR_EYE))],
+      },
+    ],
+    pts: { top: ['head', 0, -17], hand: ['armN', 0, 12], chest: ['torso', 3, -8] },
+  };
+  return { front, back, side };
+}
+
+// the shared animation set of the small bipeds; o.* add per-character touches
+const chrBipedAnims = (o = {}) => ({
+  idle: {
     n: 8,
     fn(t, P) {
-      const b = chrS(t), b2 = chrS(t, 0.15);
-      P.o.chest = [0, (o.breath || 0.35) * b, 0];
-      P.j.spine = [(o.lean || 0) + 0.02 * b2, 0, 0];
-      P.j.head = [0.04 * b2 + (o.headDown || 0), 0, 0];
-      P.j.shL = [0.04 * b, 0, 0.03 * b]; P.j.shR = [-0.04 * b + (o.readySh || 0), 0, -0.03 * b];
-      P.j.elL = [o.offEl || -0.25, 0, 0]; P.j.elR = [(o.readyEl || -0.6) - 0.04 * b, 0, 0];
-      legs(P, -0.06, -0.06, 0.1, 0.1);
-      P.t = [0, -0.25 * bob + 0.25 * bob * b, 0];
-      P.j.wpn = o.wpnIdle || [0, 0, 0];
-      if (o.idleX) o.idleX(t, P);
+      const b = chrS(t), d = b > 0.3 ? 1 : 0;
+      P.o.torso = [0, d * 0.6]; P.o.head = [0, d * 0.4];
+      for (const a of ['armL', 'armR', 'armN', 'armF']) P.o[a] = [0, d * 0.6];
+      P.r.armR = (P.view === 'back' ? -6 : 6) + 3 * b;
+      P.r.armL = (P.view === 'back' ? 4 : -4) - 3 * b;
+      P.r.armN = -14 + 2 * b; P.r.armF = 6 - 2 * b;
+      if (o.idle) o.idle(t, P);
     },
-  };
-  A.walk = {
+  },
+  walk: {
     n: 8,
     fn(t, P) {
-      const c = chrC(t), s = chrS(t);
-      legs(P, -st * c - 0.04, st * c - 0.04, kn * Math.max(0, -s) + 0.1, kn * Math.max(0, s) + 0.1);
-      P.t = [0.25 * s * bob, bob * (Math.abs(s) - 0.6), 0];
-      P.j.pelvis = [0, 0.12 * c, 0.04 * s];
-      P.j.spine = [(o.lean || 0) + 0.08, -0.12 * c, 0];
-      P.j.head = [(o.headDown || 0) - 0.04 + 0.03 * chrS(t * 2), 0.1 * c, 0];
-      P.j.shL = [sw * c, 0, 0.04]; P.j.shR = [-sw * 0.6 * c + (o.readySh || 0), 0, -0.04];
-      P.j.elL = [(o.offEl || -0.25) - 0.3 * Math.max(0, -c), 0, 0]; P.j.elR = [o.readyEl || -0.6, 0, 0];
-      P.j.wpn = o.wpnIdle || [0, 0, 0];
-      if (o.walkX) o.walkX(t, P);
+      const s = chrS(t), c = chrC(t);
+      chrLegs(P, P.view, t);
+      P.root.y = Math.abs(s) > 0.7 ? -1 : 0;
+      if (P.view === 'side') {
+        P.r.armN = 24 * s - 8; P.r.armF = -24 * s;
+        P.r.torso = 3; P.r.head = -2;
+      } else {
+        P.r.armR = (P.view === 'back' ? -1 : 1) * (8 + 10 * s); P.r.armL = (P.view === 'back' ? 1 : -1) * (6 - 10 * s);
+        P.o.armR = [0, -1.2 * s]; P.o.armL = [0, 1.2 * s];
+        P.r.torso = 2 * c;
+      }
+      if (o.walk) o.walk(t, P);
     },
-  };
-  // strike lands at 0.45 of the swing (the enemy attack cycle)
-  A.attack = {
+  },
+  // the swing: wind-up to 0.3, the hit at 0.45, recovery
+  attack: {
     n: 12, loop: false,
     fn(t, P) {
       const K = keys => chrKey(t, keys);
-      const sty = o.style || 'chop', hv = o.heavy || 0;
-      legs(P, K([[0, -0.06], [0.3, 0.15], [0.45, -0.45], [0.7, -0.4], [1, -0.06]]), K([[0, -0.06], [0.45, 0.3], [1, -0.06]]),
-        K([[0, 0.1], [0.3, 0.3], [0.45, 0.45 + hv * 0.3], [1, 0.1]]), K([[0, 0.1], [0.3, 0.25], [0.45, 0.3 + hv * 0.3], [1, 0.1]]));
-      P.t = K([[0, [0, 0, 0]], [0.3, [0, 0.4, -1.5]], [0.45, [0, -1.5 - hv * 3, 3 + hv * 3]], [0.7, [0, -1.2 - hv * 2, 3]], [1, [0, 0, 0]]]);
-      P.j.head = [K([[0, o.headDown || 0], [0.3, -0.2], [0.45, 0.15], [1, o.headDown || 0]]), 0, 0];
-      if (sty === 'chop' || sty === 'slam') {
-        P.j.spine = [(o.lean || 0) + K([[0, 0], [0.3, -0.22], [0.45, 0.38 + hv * 0.2], [0.7, 0.3], [1, 0]]), K([[0, 0], [0.3, -0.15], [0.45, 0.1], [1, 0]]), 0];
-        P.j.shR = [K([[0, (o.readySh || 0)], [0.3, -2.7], [0.45, -0.75], [0.7, -0.65], [1, (o.readySh || 0)]]), 0, K([[0, 0], [0.3, -0.3], [0.45, 0], [1, 0]])];
-        P.j.elR = [K([[0, o.readyEl || -0.6], [0.3, -1.5], [0.45, -0.15], [0.7, -0.3], [1, o.readyEl || -0.6]]), 0, 0];
-        P.j.wpn = K([[0, o.wpnIdle || [0, 0, 0]], [0.22, [Math.PI / 2, 0, 0]], [0.8, [Math.PI / 2, 0, 0]], [1, o.wpnIdle || [0, 0, 0]]]);
-        if (sty === 'slam') {
-          // both hands on the weapon
-          P.j.shL = [K([[0, 0], [0.3, -2.6], [0.45, -0.85], [0.7, -0.7], [1, 0]]), 0, K([[0, 0], [0.3, 0.25], [0.45, -0.3], [1, 0]])];
-          P.j.elL = [K([[0, o.offEl || -0.25], [0.3, -1.4], [0.45, -0.3], [1, o.offEl || -0.25]]), 0, 0];
-          P.s = K([[0, [1, 1]], [0.3, [0.97, 1.04]], [0.45, [1.06, 0.92]], [0.6, [1.02, 0.98]], [1, [1, 1]]]);
-        } else {
-          P.j.shL = [K([[0, 0], [0.3, -0.6], [0.45, 0.4], [1, 0]]), 0, K([[0, 0], [0.3, 0.3], [0.45, 0.2], [1, 0]])];
-          P.j.elL = [K([[0, o.offEl || -0.25], [0.3, -0.9], [1, o.offEl || -0.25]]), 0, 0];
-        }
-      } else if (sty === 'slash') {
-        // diagonal sword cut from high right to low left
-        P.j.spine = [(o.lean || 0) + K([[0, 0], [0.3, -0.1], [0.45, 0.25], [1, 0]]), K([[0, 0], [0.3, -0.5], [0.45, 0.35], [0.65, 0.45], [1, 0]]), 0];
-        P.j.shR = [K([[0, (o.readySh || 0)], [0.3, -2.3], [0.45, -0.9], [0.65, -0.5], [1, (o.readySh || 0)]]), K([[0, 0], [0.3, -0.4], [0.45, 0.7], [0.65, 1.0], [1, 0]]), K([[0, 0], [0.3, -0.7], [0.45, -0.2], [0.65, 0.1], [1, 0]])];
-        P.j.elR = [K([[0, o.readyEl || -0.6], [0.3, -1.3], [0.45, -0.1], [0.65, -0.35], [1, o.readyEl || -0.6]]), 0, 0];
-        P.j.wpn = K([[0, o.wpnIdle || [0, 0, 0]], [0.22, [Math.PI / 2, 0, 0.6]], [0.8, [Math.PI / 2, 0, 0.6]], [1, o.wpnIdle || [0, 0, 0]]]);
-        P.j.shL = [K([[0, 0], [0.3, -0.4], [0.45, 0.3], [1, 0]]), 0, K([[0, 0.05], [0.3, 0.3], [0.45, 0.15], [1, 0.05]])];
-        P.j.elL = [K([[0, o.offEl || -0.25], [0.3, -0.8], [1, o.offEl || -0.25]]), 0, 0];
-      } else if (sty === 'fists') {
-        // both fists up, then hammered down together
-        P.j.spine = [(o.lean || 0) + K([[0, 0], [0.3, -0.25], [0.45, 0.5], [0.7, 0.4], [1, 0]]), 0, 0];
-        for (const s of ['L', 'R']) {
-          const sg = s === 'L' ? 1 : -1;
-          P.j['sh' + s] = [K([[0, 0], [0.3, -2.8], [0.45, -0.9], [0.7, -0.8], [1, 0]]), 0, sg * K([[0, 0], [0.3, -0.1], [0.45, -0.25], [1, 0]])];
-          P.j['el' + s] = [K([[0, -0.3], [0.3, -1.2], [0.45, -0.1], [1, -0.3]]), 0, 0];
-        }
-        P.s = K([[0, [1, 1]], [0.3, [0.96, 1.05]], [0.45, [1.07, 0.9]], [0.62, [1.02, 0.98]], [1, [1, 1]]]);
+      if (P.view === 'side') {
+        P.r.armN = K([[0, -14], [0.3, 150, ease.outCubic], [0.45, -40, ease.inQuad], [0.62, -30], [1, -14]]);
+        P.r.torso = K([[0, 0], [0.3, -8], [0.45, 10, ease.inQuad], [1, 0]]);
+        P.r.head = K([[0, 0], [0.3, 4], [0.45, -6], [1, 0]]);
+        P.root.x = K([[0, 0], [0.3, -1], [0.45, 2], [1, 0]]);
+        P.r.legN = K([[0, 0], [0.45, -16], [1, 0]]); P.r.legF = K([[0, 0], [0.45, 14], [1, 0]]);
+        P.r.armF = K([[0, 6], [0.3, -20], [0.45, 30], [1, 6]]);
+      } else {
+        const sg = P.view === 'back' ? -1 : 1;
+        P.r.armR = sg * K([[0, 6], [0.3, 160, ease.outCubic], [0.45, -24, ease.inQuad], [0.62, -16], [1, 6]]);
+        P.o.armR = K([[0, [0, 0]], [0.3, [0, -2]], [0.45, [sg * 2, 1]], [1, [0, 0]]]);
+        P.r.torso = sg * K([[0, 0], [0.3, -5], [0.45, 7, ease.inQuad], [1, 0]]);
+        P.r.head = sg * K([[0, 0], [0.3, -4], [0.45, 4], [1, 0]]);
+        P.root.y = K([[0, 0], [0.3, -1], [0.45, 1], [1, 0]]);
+        P.r.armL = sg * K([[0, -4], [0.3, -14], [0.45, 10], [1, -4]]);
+        if (P.view === 'back' && t > 0.22 && t < 0.55) P.z.armR = 6;
       }
-      if (o.attackX) o.attackX(t, P);
+      if (o.attack) o.attack(t, P);
     },
-  };
-  // flinch when hit
-  A.hit = {
+  },
+  hit: {
     n: 3, loop: false,
     fn(t, P) {
       const k = 1 - t;
-      A.idle.fn(0, P);
-      P.j.spine = [(o.lean || 0) - 0.3 * k, 0, 0.05 * k];
-      P.j.head = [-0.35 * k + (o.headDown || 0), 0, 0];
-      P.j.shL = [-0.3 * k, 0, 0.4 * k]; P.j.shR = [-0.3 * k + (o.readySh || 0), 0, -0.4 * k];
-      P.t = [0, 0, -1.5 * k];
+      if (P.view === 'side') { P.r.torso = -10 * k; P.root.x = -1.5 * k; P.r.head = -8 * k; P.r.armN = 20 * k - 14; }
+      else { P.root.y = -1 * k; P.r.head = 6 * k; P.r.armR = 16 * k; P.r.armL = -16 * k; P.s.torso = [1, 1 - 0.05 * k]; }
+      if (o.hit) o.hit(t, P);
     },
+  },
+});
+
+CHR.models.swordman = {
+  size: [72, 72], anchor: [36, 58],
+  mats: CHR_SWORD_MATS,
+  views: chrSwordViews(),
+  anims: chrBipedAnims(),
+};
+
+// ---------------------------------------------------------------------------
+// the spearman (the two island-1 knights, model TT_Spearman): chainmail coif and
+// shirt over a red tunic, studded leather collar, belt, boots, a long spear
+// ---------------------------------------------------------------------------
+const CHR_SPEAR_MATS = (() => {
+  const O = { out: '#1b0d0c' };
+  return {
+    skin: chrMat(chrRamp('#7a3c1e', '#b46a42', '#d8834e', '#f8a468', '#fcc08a'), O),
+    mail: chrMat(chrRamp('#24252c', '#3e4048', '#555760', '#6d717c', '#9aa4b4'), O),
+    mailHi: chrMat(chrRamp('#2e3038', '#585c68', '#858d9b', '#abb7c5', '#d2dceb'), O),
+    red: chrMat(chrRamp('#3e0c08', '#6e140c', '#962312', '#ba2f17', '#dc4a26'), O),
+    leather: chrMat(chrRamp('#24140c', '#3a2416', '#4e3024', '#66432e', '#895636'), O),
+    pants: chrMat(chrRamp('#1c100c', '#2c1a12', '#3a241a', '#4c3022', '#5e3e2c'), O),
+    boot: chrMat(chrRamp('#100806', '#1a0f0c', '#26170f', '#34221a', '#463024'), O),
+    metal: chrMat(chrRamp('#2e2a2a', '#5c5654', '#86827f', '#b8bcc2', '#eef2f6'), O),
+    wood: chrMat(chrRamp('#2a160c', '#4a2c18', '#6e4426', '#8e5a34', '#a8703e'), O),
   };
-  return A;
-}
-
-// ---------------------------------------------------------------------------
-// the hooded bandit (easy): rusty tunic, rope belt, red bandana, hand axe
-// ---------------------------------------------------------------------------
-const chrPat = {
-  hoodFace(x, y, z) {
-    // the face opening of the hood
-    if (z > 0.3 && y < 0.5 && y > -0.75 && Math.abs(x) < 0.66 - Math.max(0, y) * 0.3) return 'x';
-    if (z > 0.18 && y < 0.62 && y > -0.85 && Math.abs(x) < 0.78 - Math.max(0, y) * 0.3) return -1;
-    return 0;
-  },
-  banditFace(x, y, z) {
-    if (z < 0.4) return 0;
-    for (const s of [-1, 1]) {
-      const ex = (x - s * 0.34) / 0.13, ey = (y - 0.18) / 0.15;
-      if (ex * ex + ey * ey < 1) return 'hole';
-      // angry brows
-      if (Math.abs(y - 0.38 - s * (x - s * 0.34) * 0.9) < 0.07 && Math.abs(x - s * 0.34) < 0.2) return { m: 'hood', i: 0 };
-    }
-    return 0;
-  },
-  bandana(x, y, z) {
-    if (y > 0.5 - Math.abs(x) * 0.15) return 'x';
-    if (((x * 3 + y * 2 + 9) % 0.7) < 0.12) return -1;
-    return 0;
-  },
-  tunic(x, y, z) {
-    // a sewn patch, laces at the neck
-    const px = (x + 0.35) / 0.22, py = (y + 0.1) / 0.2;
-    if (z > 0 && Math.abs(px) < 1 && Math.abs(py) < 1) return Math.abs(px) > 0.8 || Math.abs(py) > 0.75 ? { m: 'pants', i: 1 } : 'pants';
-    if (z > 0.6 && y > 0.45 && Math.abs(x) < 0.08) return { m: 'tunic', i: 0 };
-    if (z > 0.55 && y > 0.4 && Math.abs(Math.abs(x) - 0.12) < 0.05 && ((y * 20) % 1) < 0.5) return 'rope';
-    // satchel strap
-    if (Math.abs(x * 0.7 - y * 0.7 + 0.05) < 0.1) return 'leather';
-    return 0;
-  },
-  rope(x, y, z) { return ((Math.atan2(z, x) / TAU + y * 0.5 + 4) * 12) % 1 < 0.3 ? -1 : 0; },
-  axe(x, y, z) {
-    if (y < -0.62) return 1;
-    if (y > 0.7 || z < -0.75) return -1;
-    return 0;
-  },
-  knee(x, y, z) { return z > 0.55 && y > 0.6 ? 'leather' : 0; },
+})();
+// chainmail: offset rows of little rings
+const chrMailPat = (u, v, lx, ly) => {
+  const r = Math.floor(ly * 0.62 + 40), c = Math.floor(lx * 0.62 + 40 + (r & 1) * 0.5);
+  const fx = lx * 0.62 + 40 + (r & 1) * 0.5 - c, fy = ly * 0.62 + 40 - r;
+  if (fy < 0.3) return -1;
+  if (fx < 0.28) return -1;
+  return (r + c) % 3 === 0 ? { m: 'mailHi' } : 0;
 };
 
-CHR.models.bandit = {
-  size: [72, 72], anchor: [36, 60],
-  mats: chrMats({
-    tunic: chrMat(chrRamp('#1e0d10', '#4a1c1c', '#7a3226', '#a8513a', '#cf7d58')),
-    pants: chrMat(chrRamp('#14121a', '#2a2632', '#46404e', '#655c6c', '#8a8090')),
-    hood: chrMat(chrRamp('#170e0c', '#33201a', '#54352a', '#7a5240', '#a27a5c')),
-    red: chrMat(chrRamp('#2a0610', '#5a0e1a', '#952026', '#c84034', '#ef7a5e')),
-    rope: chrMat(chrRamp('#2a1e10', '#5c4424', '#8e7040', '#b89a62', '#dcc48a')),
-  }),
-  joints: chrRig({ hip: 16.5, spine: 3.5, chest: 7, neck: 2.6, headY: 2.4, headZ: 0.6, shX: 6.4, shY: 1.4, upArm: 6, foreArm: 5.4, legX: 3.2, thigh: 6.5, shin: 6.4, armOut: 0.16 }),
-  parts: [
-    chrP('pelvis', 'ell', [0, 0.5, 0], [5.6, 3.8, 4.4], 'pants', 1),
-    chrP('pelvis', 'cyl', [0, 3.2, 0.2], [5.7, 1.0, 4.6], 'rope', 1, { pat: chrPat.rope }),
-    chrP('spine', 'ell', [0, 2.8, 0.4], [5.9, 5.4, 4.6], 'tunic', 1, { pat: chrPat.tunic }),
-    chrP('chest', 'ell', [0, -0.6, 0], [6.6, 5.2, 4.6], 'tunic', 1, { pat: chrPat.tunic }),
-    chrP('pelvis', 'box', [-5.8, 1, 1], [1.4, 2.6, 2.4], 'leather', 1),
-    chrP('neck', 'ell', [0, 0, 0.2], [2.4, 2.2, 2.2], 'skin', 2),
-    chrP('head', 'ell', [0, 4.6, 0.3], [5.4, 5.8, 5.2], 'skin', 2, { pat: chrPat.banditFace }),
-    chrP('head', 'ell', [0, 2.7, 2.1], [5.1, 3.6, 4.2], 'red', 2, { pat: chrPat.bandana }),
-    chrP('head', 'ell', [0, 5.6, -0.4], [6.3, 6.6, 6.1], 'hood', 2, { pat: chrPat.hoodFace }),
-    chrP('head', 'cone', [0, 6.4, -6.4], [2.4, 3.8, 2.4], 'hood', 2, { rot: [-1.35, 0, 0] }),
-    chrP('shL', 'rc', [0, 0, 0], [2.4, 1.9], 'tunic', 3, { b: [0, -6, 0] }),
-    chrP('elL', 'rc', [0, 0, 0], [1.9, 1.6], 'skin', 3, { b: [0, -5.2, 0.3] }),
-    chrP('elL', 'cyl', [0, -3.4, 0.2], [1.95, 1.1, 1.95], 'leather', 3),
-    chrP('haL', 'ell', [0, -1.3, 0.3], [1.9, 2, 2], 'skin', 3),
-    chrP('shR', 'rc', [0, 0, 0], [2.4, 1.9], 'tunic', 4, { b: [0, -6, 0] }),
-    chrP('elR', 'rc', [0, 0, 0], [1.9, 1.6], 'skin', 4, { b: [0, -5.2, 0.3] }),
-    chrP('elR', 'cyl', [0, -3.4, 0.2], [1.95, 1.1, 1.95], 'leather', 4),
-    chrP('haR', 'ell', [0, -1.3, 0.3], [1.9, 2, 2], 'skin', 4),
-    chrP('hipL', 'rc', [0, 0, 0], [2.7, 2.1], 'pants', 5, { b: [0, -6.4, 0] }),
-    chrP('knL', 'rc', [0, 0, 0], [2.1, 1.7], 'pants', 5, { b: [0, -5.8, 0.3], pat: chrPat.knee }),
-    chrP('ftL', 'ell', [0, -1.2, 1.2], [2.2, 1.7, 3.2], 'boot', 5),
-    chrP('hipR', 'rc', [0, 0, 0], [2.7, 2.1], 'pants', 6, { b: [0, -6.4, 0] }),
-    chrP('knR', 'rc', [0, 0, 0], [2.1, 1.7], 'pants', 6, { b: [0, -5.8, 0.3], pat: chrPat.knee }),
-    chrP('ftR', 'ell', [0, -1.2, 1.2], [2.2, 1.7, 3.2], 'boot', 6),
-    chrP('wpn', 'cyl', [0, 0, 3.4], [0.6, 5, 0.6], 'wood', 7, { rot: [Math.PI / 2, 0, 0] }),
-    chrP('wpn', 'box', [0, -1.7, 7.6], [0.45, 2.5, 1.7], 'steel', 7, { pat: chrPat.axe }),
-  ],
-  pts: { top: ['head', [0, 11, 0]], hand: ['haR', [0, -1.5, 0.5]], chest: ['chest', [0, 0, 4]] },
-  anims: chrHumanAnims({ stride: 0.55, knee: 1.1, bob: 0.9, armSwing: 0.5, style: 'chop', readyEl: -0.7, wpnIdle: [0.9, 0, 0], lean: 0.06 }),
-};
+// the spear, grip at the origin, shaft along +y (the point at the far end)
+const chrSpear = (back, fwd) => [
+  chrCap(0, -back, 0, fwd, 1, 1, 'wood'),
+  chrB(0, fwd + 0.6, 1.9, 0.9, 0.6, 'metal'),
+  chrPoly([[-1.8, fwd + 1.2], [1.8, fwd + 1.2], [1.2, fwd + 5], [0, fwd + 8.6], [-1.2, fwd + 5]], 'metal', { bev: 1.2 }),
+];
 
-// ---------------------------------------------------------------------------
-// the knight: great helm with a plume, mail, blue surcoat with a gold chevron,
-// kite shield, longsword. The dark knight reuses the rig, blackened and horned
-// ---------------------------------------------------------------------------
-Object.assign(chrPat, {
-  mail(x, y, z) {
-    // rows of rings: offset checker in unit space
-    const r = Math.floor((y + 2) * 9), c = Math.floor((Math.atan2(z, x) / TAU + 2) * 26 + (r & 1) * 0.5);
-    return (r + c) & 1 ? -1 : 0;
-  },
-  surcoat(x, y, z) {
-    if (Math.abs(x) > 0.78 || z < -0.15) return { m: 'mail', d: 0 };
-    // gold chevron on the chest
-    if (z > 0 && Math.abs(y - 0.05 + Math.abs(x) * 0.9) < 0.14 && Math.abs(x) < 0.6) return 'gold';
-    if (Math.abs(Math.abs(x) - 0.74) < 0.05) return 'gold';
-    return 0;
-  },
-  tabardSkirt(x, y, z) {
-    if (Math.abs(x) > 0.82) return 'gold';
-    if (y < -0.7 && ((x + 1) * 3) % 1 < 0.5) return 'x';
-    return 0;
-  },
-  greathelm(x, y, z) {
-    if (z > 0.3) {
-      if (Math.abs(y - 0.18) < 0.09 && Math.abs(x) < 0.72 && Math.abs(x) > 0.06) return 'hole';  // eye slit
-      if (Math.abs(x) < 0.08 && y < 0.35) return 1;                                                // nasal ridge
-      if (y < -0.3 && y > -0.75 && Math.abs(x) < 0.5 && Math.abs(x) > 0.12 && ((x + 1) * 7) % 1 < 0.28 && ((y + 1) * 5) % 1 < 0.4) return 'hole'; // breaths
-    }
-    if (Math.abs(y + 0.92) < 0.08) return -1;
-    return 0;
-  },
-  greathelmDark(x, y, z) {
-    if (z > 0.3 && Math.abs(y - 0.18) < 0.1 && Math.abs(x) < 0.72 && Math.abs(x) > 0.06) return Math.abs(Math.abs(x) - 0.38) < 0.14 ? 'glowR' : 'hole';
-    if (z > 0.3 && Math.abs(x) < 0.08 && y < 0.35) return 1;
-    if (Math.abs(y + 0.92) < 0.08) return -1;
-    return 0;
-  },
-  blade(x, y, z) {
-    if (Math.abs(y) < 0.22 && z < 0.8) return -1;   // fuller
-    if (Math.abs(y) > 0.75) return 1;               // edges
-    if (z > 0.86 && Math.abs(y) > 0.9 - (z - 0.86) * 6) return 'x'; // tip
-    return 0;
-  },
-  shield(x, y, z) {
-    // kite shape (box x width, y height) with a steel rim, a gold chevron and a boss
-    const w = 1 - Math.max(0, -y) * 0.75;
-    if (Math.abs(x) > w) return 'x';
-    if (Math.abs(x) > w - 0.14 || y > 0.88) return 'steel';
-    if (Math.abs(y - 0.25 + Math.abs(x) * 0.8) < 0.13) return 'gold';
-    return 0;
-  },
-  cape(x, y, z) {
-    if (y < -0.75 && ((x + 1) * 4) % 1 < 0.45) return 'x';
-    if (((x + 1) * 5) % 1 < 0.12) return -1;
-    return 0;
-  },
-});
-
-const chrKnightRig = { hip: 18.5, spine: 4, chest: 8, neck: 2.8, headY: 2.6, shX: 7.8, shY: 1.6, upArm: 6.6, foreArm: 6, legX: 3.6, thigh: 7.2, shin: 7.2, armOut: 0.14 };
-function chrKnightParts(dark) {
-  const helm = dark ? chrPat.greathelmDark : chrPat.greathelm;
-  const P = [
-    chrP('pelvis', 'ell', [0, 0.5, 0], [6.4, 4.2, 5], 'mail', 1, { pat: chrPat.mail }),
-    chrP('pelvis', 'box', [0, -2.6, 4.6], [3.6, 4.8, 0.5], 'tabard', 1, { pat: chrPat.tabardSkirt, rot: [0.08, 0, 0] }),
-    chrP('pelvis', 'cyl', [0, 3.4, 0.2], [6.6, 1.1, 5.3], 'leather', 1),
-    chrP('pelvis', 'box', [0, 3.4, 5.4], [1.3, 1, 0.4], 'gold', 1),
-    chrP('spine', 'ell', [0, 3, 0.3], [6.7, 5.8, 5.1], 'tabard', 1, { pat: chrPat.surcoat }),
-    chrP('chest', 'ell', [0, -0.4, 0], [7.7, 6, 5.5], 'tabard', 1, { pat: chrPat.surcoat }),
-    chrP('neck', 'cyl', [0, 0, 0], [3.3, 1.8, 3.3], 'steel', 2),
-    chrP('head', 'cyl', [0, 4.8, 0.2], [5.1, 5.4, 5.1], 'steel', 2, { pat: helm }),
-    chrP('head', 'ell', [0, 10.1, 0.2], [5.1, 2.4, 5.1], 'steel', 2),
-    chrP('shL', 'ell', [1.4, 0.9, 0], [3.8, 3, 3.8], 'steel', 3),
-    chrP('shL', 'rc', [0, 0, 0], [2.5, 2.1], 'mail', 3, { b: [0, -6.6, 0], pat: chrPat.mail }),
-    chrP('elL', 'rc', [0, 0, 0], [2.2, 1.9], 'mail', 3, { b: [0, -5.6, 0.3], pat: chrPat.mail }),
-    chrP('elL', 'cyl', [0, -3.6, 0.3], [2.3, 1.8, 2.3], 'steel', 3),
-    chrP('haL', 'ell', [0, -1.4, 0.4], [2.1, 2.2, 2.2], 'steel', 3),
-    chrP('shR', 'ell', [-1.4, 0.9, 0], [3.8, 3, 3.8], 'steel', 4),
-    chrP('shR', 'rc', [0, 0, 0], [2.5, 2.1], 'mail', 4, { b: [0, -6.6, 0], pat: chrPat.mail }),
-    chrP('elR', 'rc', [0, 0, 0], [2.2, 1.9], 'mail', 4, { b: [0, -5.6, 0.3], pat: chrPat.mail }),
-    chrP('elR', 'cyl', [0, -3.6, 0.3], [2.3, 1.8, 2.3], 'steel', 4),
-    chrP('haR', 'ell', [0, -1.4, 0.4], [2.1, 2.2, 2.2], 'steel', 4),
-    chrP('hipL', 'rc', [0, 0, 0], [2.9, 2.3], 'mail', 5, { b: [0, -7.2, 0], pat: chrPat.mail }),
-    chrP('knL', 'rc', [0, 0.6, 0.2], [2.5, 2.0], 'steel', 5, { b: [0, -6.4, 0.4] }),
-    chrP('knL', 'ell', [0, 0.4, 1.4], [2.2, 2.0, 1.5], 'steel', 5),
-    chrP('ftL', 'ell', [0, -1.4, 1.5], [2.4, 1.8, 3.6], 'steel', 5),
-    chrP('hipR', 'rc', [0, 0, 0], [2.9, 2.3], 'mail', 6, { b: [0, -7.2, 0], pat: chrPat.mail }),
-    chrP('knR', 'rc', [0, 0.6, 0.2], [2.5, 2.0], 'steel', 6, { b: [0, -6.4, 0.4] }),
-    chrP('knR', 'ell', [0, 0.4, 1.4], [2.2, 2.0, 1.5], 'steel', 6),
-    chrP('ftR', 'ell', [0, -1.4, 1.5], [2.4, 1.8, 3.6], 'steel', 6),
+function chrSpearViews() {
+  const leg = (n, x) => ({ n, p: null, at: [x, -14], z: 1, sh: [chrB(0, 7, 4.9, 7.1, 2.6, 'pants', { pat: (u, v) => (v > 0.45 ? 'boot' : 0) })] });
+  const arm = (n, x, z, dark) => ({
+    n, p: 'torso', at: [x, -13], z,
+    sh: [
+      chrCap(0, 0, 0, 10.4, 3.9, 3.4, 'red', { pat: u => (u > 0.62 ? 'skin' : dark ? -1 : 0) }),
+      chrE(0, 13, 3.6, 3.4, 'skin', { pat: () => (dark ? -1 : 0) }),
+    ],
+  });
+  const collar = (rx) => chrE(0, -15.4, rx, 3.6, 'leather', { g: 2, ln: true });
+  const studs = (y, n, w) => chrD(-w, y, [Array.from({ length: n }, (_, i) => (i % 2 ? '.' : 'o')).join('')], { o: ['metal', 2] });
+  const torsoSh = rx => [
+    chrB(0, -1.8, rx, 2.6, 1.6, 'red', { g: 1 }),
+    chrB(0, -9, rx - 0.4, 7.4, 4, 'mail', { pat: chrMailPat }),
+    chrB(0, -3.4, rx - 0.2, 1.5, 1, 'leather', { g: 2, ln: true }),
   ];
-  if (!dark) {
-    P.push(
-      chrP('head', 'ell', [0, 12.4, -1], [1.4, 2.8, 3.6], 'plume', 2, { rot: [-0.4, 0, 0] }),
-      chrP('wpn', 'cyl', [0, 0, 0.6], [0.6, 2, 0.6], 'leather', 7, { rot: [Math.PI / 2, 0, 0] }),
-      chrP('wpn', 'ell', [0, 0, -1.6], [0.9, 0.9, 0.9], 'gold', 7),
-      chrP('wpn', 'box', [0, 0, 2.9], [0.5, 2.6, 0.5], 'gold', 7),
-      chrP('wpn', 'box', [0, 0, 10.6], [0.35, 1.15, 7.4], 'steel', 7, { pat: chrPat.blade }),
-      chrP('elL', 'box', [2.6, -3.4, 1.6], [3.9, 5.6, 0.55], 'tabard', 8, { pat: chrPat.shield, rot: [0, 0.75, 0] }),
-      chrP('elL', 'ell', [3.1, -2.8, 2.2], [1.2, 1.2, 0.8], 'steel', 8, { rot: [0, 0.75, 0] }),
-    );
+  const front = {
+    parts: [
+      leg('legL', -4.8), leg('legR', 4.8),
+      { n: 'torso', p: null, at: [0, -14], z: 3, sh: [...torsoSh(11), collar(9)], dc: [studs(-16, 9, 4), chrD(-1.5, -5, ['MMM'], { M: ['metal', 3] })] },
+      arm('armR', -12, 4), arm('armL', 12, 4),
+      { n: 'spear', p: 'armR', at: [0, 13], r0: 24, z: 5, sh: chrSpear(16, 6) },
+      {
+        n: 'head', p: 'torso', at: [0, -15], z: 6,
+        sh: [
+          chrB(0, -9.2, 9.4, 9.6, 5.6, 'mail', { pat: chrMailPat, g: 1 }),
+          chrB(0, -6.6, 6.2, 5.4, 3.4, 'skin', { flat: 0.2, g: 2, ln: true }),
+        ],
+        dc: [chrD(-5, -9, [
+          '.BBB..BBB.',
+          '.PPP..PPP.',
+          '.WPW..WPW.',
+          '..........',
+          '...MMMM...',
+        ], Object.assign({ M: ['skin', 1] }, CHR_EYE))],
+      },
+    ],
+    pts: { top: ['head', 0, -19], hand: ['armR', 0, 13], chest: ['torso', 0, -9] },
+  };
+  const back = {
+    parts: [
+      leg('legL', 4.8), leg('legR', -4.8),
+      { n: 'torso', p: null, at: [0, -14], z: 3, sh: [...torsoSh(11), collar(9)], dc: [studs(-17, 9, 4)] },
+      arm('armR', 12, 4), arm('armL', -12, 4),
+      { n: 'spear', p: 'armR', at: [0, 13], r0: -24, z: 2, sh: chrSpear(16, 6) },
+      { n: 'head', p: 'torso', at: [0, -15], z: 6, sh: [chrB(0, -9.2, 9.6, 9.8, 5.8, 'mail', { pat: chrMailPat })] },
+    ],
+    pts: { top: ['head', 0, -19], hand: ['armR', 0, 13], chest: ['torso', 0, -9] },
+  };
+  const side = {
+    parts: [
+      { n: 'torso', p: null, at: [0, -14], z: 3, sh: [...torsoSh(7.4), collar(7)], dc: [studs(-17, 5, 2)] },
+      Object.assign(arm('armF', -1, 0, true), { n: 'armF' }),
+      { n: 'legF', p: null, at: [-1.8, -14], z: 1, sh: [chrB(0, 7, 4, 7.1, 2.4, 'pants', { pat: (u, v) => (v > 0.45 ? { m: 'boot', d: -1 } : -1) }), chrB(1.6, 13.2, 3.4, 1.2, 1, 'boot', { pat: () => -1 })] },
+      { n: 'legN', p: null, at: [1.6, -14], z: 2, sh: [chrB(0, 7, 4, 7.1, 2.4, 'pants', { pat: (u, v) => (v > 0.45 ? 'boot' : 0) }), chrB(1.6, 13.2, 3.4, 1.2, 1, 'boot')] },
+      Object.assign(arm('armN', 0.8, 5), { n: 'armN' }),
+      { n: 'spear', p: 'armN', at: [0, 13], r0: -90, z: 6, sh: chrSpear(15, 12) },
+      {
+        n: 'head', p: 'torso', at: [0.8, -15], z: 7,
+        sh: [
+          chrB(-0.4, -9.2, 8.8, 9.6, 5.4, 'mail', { pat: chrMailPat, g: 1 }),
+          chrB(5.2, -6.6, 3.6, 5.2, 2.6, 'skin', { flat: 0.2, g: 2, ln: true }),
+        ],
+        dc: [chrD(5, -9, ['BBB', 'WPP', '.W.', '...', '.MM'], Object.assign({ M: ['skin', 1] }, CHR_EYE))],
+      },
+    ],
+    pts: { top: ['head', 0, -19], hand: ['armN', 0, 13], chest: ['torso', 3, -9] },
+  };
+  return { front, back, side };
+}
+
+// a thrust: the spear draws back, then stabs forward at 0.45
+const chrSpearAttack = (t, P) => {
+  const K = keys => chrKey(t, keys);
+  if (P.view === 'side') {
+    P.r.armN = K([[0, -14], [0.3, 30, ease.outCubic], [0.45, -62, ease.inQuad], [0.62, -58], [1, -14]]);
+    P.o.armN = K([[0, [0, 0]], [0.3, [-3, 0]], [0.45, [4, 0]], [0.62, [3, 0]], [1, [0, 0]]]);
+    P.r.spear = K([[0, 0], [0.3, -20], [0.45, 32], [0.62, 28], [1, 0]]);
+    P.r.torso = K([[0, 0], [0.3, -6], [0.45, 8], [1, 0]]);
+    P.root.x = K([[0, 0], [0.3, -2], [0.45, 3], [1, 0]]);
   } else {
-    P.push(
-      // horns, a ragged purple cape, the bat-wing cleaver
-      chrP('head', 'cone', [4.6, 9.8, 0], [1.4, 3.8, 1.4], 'bone', 2, { rot: [0, 0, -0.9] }),
-      chrP('head', 'cone', [-4.6, 9.8, 0], [1.4, 3.8, 1.4], 'bone', 2, { rot: [0, 0, 0.9] }),
-      chrP('cape', 'box', [0, -8, -1], [6.6, 9, 0.5], 'tabard', 9, { pat: chrPat.cape }),
-      chrP('wpn', 'cyl', [0, 0, 1], [0.7, 2.6, 0.7], 'leather', 7, { rot: [Math.PI / 2, 0, 0] }),
-      chrP('wpn', 'box', [0, -2.4, 9.5], [0.5, 4.2, 6.4], 'bat', 7, { pat: chrHeroPat.batblade }),
-      chrP('wpn', 'ell', [0, 0.6, 3.8], [0.9, 1.2, 0.9], 'glowR', 7),
-    );
+    const sg = P.view === 'back' ? -1 : 1;
+    P.r.armR = sg * K([[0, 6], [0.3, 60, ease.outCubic], [0.45, -10, ease.inQuad], [1, 6]]);
+    P.o.armR = K([[0, [0, 0]], [0.3, [-sg * 1, -3]], [0.45, [sg * 2, 2]], [1, [0, 0]]]);
+    P.r.spear = sg * K([[0, 0], [0.3, 40], [0.45, -18], [1, 0]]);
+    P.root.y = K([[0, 0], [0.3, -1], [0.45, 1], [1, 0]]);
   }
-  return P;
-}
-
-CHR.models.knight = {
-  size: [84, 84], anchor: [42, 68],
-  mats: chrMats({
-    mail: chrMat(chrRamp('#121420', '#2a3040', '#4c5468', '#7c869a', '#aab4c6')),
-    tabard: chrMat(chrRamp('#0c1024', '#1a2450', '#28408a', '#4062b8', '#7a98e0')),
-    gold: chrMat(chrRamp('#2a1606', '#6a420e', '#b07a1a', '#e8b83c', '#fff0a0'), { spec: '#ffffff' }),
-    plume: chrMat(chrRamp('#2a0610', '#5a0e1a', '#952026', '#c84034', '#ef7a5e')),
-  }),
-  joints: chrRig(chrKnightRig),
-  parts: chrKnightParts(false),
-  pts: { top: ['head', [0, 14, 0]], hand: ['haR', [0, -1.5, 0.5]], chest: ['chest', [0, 0, 5]] },
-  anims: chrHumanAnims({ stride: 0.5, knee: 1.0, bob: 1, armSwing: 0.35, style: 'slash', readyEl: -0.9, wpnIdle: [1.3, 0, 0], offEl: -0.9, lean: 0.04 }),
 };
+const chrSpearAnims = chrBipedAnims();
+chrSpearAnims.attack = { n: 12, loop: false, fn(t, P) { chrSpearAnims.walk.fn(0, P); P.root.y = 0; for (const k of ['legN', 'legF']) P.r[k] = 0; P.o.legL = P.o.legR = [0, 0]; P.s.legL = P.s.legR = [1, 1]; chrSpearAttack(t, P); } };
 
-CHR.models.knight2 = {
-  size: [96, 96], anchor: [48, 78], k: 1.08,
-  mats: chrMats({
-    mail: chrMat(chrRamp('#0a0a12', '#1a1a26', '#2e2e40', '#4a4a62', '#6e6e8c')),
-    tabard: chrMat(chrRamp('#14081e', '#2e1046', '#4e1c72', '#7a32a4', '#b064d8')),
-    gold: chrMat(chrRamp('#1e0a10', '#4a1420', '#7e2430', '#b03c44', '#e0706a')),
-    steel: chrMat(chrRamp('#0c0c14', '#22222e', '#3e3e50', '#62627a', '#9a9ab4'), { spec: '#d8d8ff', specT: 0.92 }),
-    bat: CHR_MATS_HERO.bat,
-  }),
-  joints: chrRig(Object.assign({}, chrKnightRig, { extra: [{ n: 'cape', p: 'chest', at: [0, 1.5, -5] }] })),
-  parts: chrKnightParts(true),
-  pts: { top: ['head', [0, 14, 0]], hand: ['haR', [0, -1.5, 0.5]], chest: ['chest', [0, 0, 5]] },
-  anims: chrHumanAnims({
-    stride: 0.48, knee: 1.0, bob: 1.1, armSwing: 0.3, style: 'slash', readyEl: -0.9, wpnIdle: [1.2, 0, 0], offEl: -0.4, lean: 0.06,
-    idleX(t, P) { P.j.cape = [0.08 + 0.04 * chrS(t), 0, 0]; },
-    walkX(t, P) { P.j.cape = [0.3 + 0.1 * chrS(t * 2), 0, 0.05 * chrC(t)]; },
-    attackX(t, P) { P.j.cape = [chrKey(t, [[0, 0.1], [0.45, 0.5], [1, 0.1]]), 0, 0]; },
-  }),
+CHR.models.spearman = {
+  size: [96, 96], anchor: [48, 76],
+  mats: CHR_SPEAR_MATS,
+  views: chrSpearViews(),
+  anims: chrSpearAnims,
 };
 
 // ---------------------------------------------------------------------------
-// the troll (boss): hunched blue-green brute, underbite with tusks, red mohawk,
-// bone necklace, fur loincloth with a skull buckle, spiked iron-banded club
+// the troll (island-1 boss): blue hulk, red mohawk, long ears, tusks, a drooping
+// white moustache over a purple beard, a red shoulder plate with gold spirals,
+// a red and gold belt and loincloth, spiked wheel gauntlets on both fists
 // ---------------------------------------------------------------------------
-Object.assign(chrPat, {
-  trollSkin(x, y, z) {
-    // warts and blotches
-    const n = chrNoise(x * 7 + 3, y * 7 + z * 5, 11);
-    if (n > 0.86) return 1;
-    if (n < 0.1) return -1;
-    return 0;
-  },
-  trollBelly(x, y, z) {
-    if (z > 0.6 && Math.abs(x) < 0.08 && Math.abs(y + 0.1) < 0.08) return { m: 'troll', i: 0 }; // navel
-    if (z > 0.3 && Math.abs(y - 0.55 + x * x * 0.4) < 0.05) return -1;                          // chest crease
-    return chrPat.trollSkin(x, y, z);
-  },
-  trollJaw(x, y, z) {
-    if (z < 0.35) return 0;
-    if (Math.abs(y - 0.35 + x * x * 0.3) < 0.09 && Math.abs(x) < 0.7) return 'hole';
-    if (y > 0.22 && y < 0.5 && Math.abs(x) < 0.62 && ((x + 1) * 6) % 1 < 0.45 && Math.abs(y - 0.35 + x * x * 0.3) < 0.18) return 'bone';
-    return 0;
-  },
-  fur(x, y, z) {
-    if (y < -0.5 && chrNoise(Math.atan2(z, x) * 6, 2, 3) * 0.55 + 0.5 < -y) return 'x';
-    const a = (Math.atan2(z, x) / TAU + 1) * 22 + chrNoise(y * 3, x * 3, 1) * 2;
-    return a % 1 < 0.28 ? -1 : 0;
-  },
-  club(x, y, z) {
-    const n = (Math.atan2(z, x) / TAU + 1) * 9 + chrNoise(y * 6, 1, 4);
-    if (n % 1 < 0.14) return -1;
-    if (chrNoise(y * 9, x * 3, 7) > 0.8) return { m: 'wood', d: 1 };
-    return 0;
-  },
-  skullBuckle(x, y, z) {
-    for (const s of [-1, 1]) { const ex = (x - s * 0.34) / 0.22, ey = (y - 0.1) / 0.22; if (ex * ex + ey * ey < 1 && z > 0.3) return 'hole'; }
-    if (z > 0.4 && y < -0.35 && ((x + 1) * 5) % 1 < 0.5) return -1;
-    return 0;
-  },
-  toes(x, y, z) {
-    if (z > 0.55 && ((x + 1) * 3) % 1 < 0.14) return -1;
-    if (z > 0.82 && y > -0.2) return 'bone';
-    return 0;
-  },
-});
+const CHR_TROLL_MATS = (() => {
+  const O = { out: '#231115' };
+  return {
+    skin: chrMat(chrRamp('#1a2036', '#2c3858', '#3b4b73', '#52799b', '#76aac6'), O),
+    red: chrMat(chrRamp('#3e0e0e', '#6e1a14', '#a7241f', '#d8341c', '#f05a2c'), O),
+    gold: chrMat(chrRamp('#4a2c08', '#7a5014', '#b8862a', '#eaae59', '#fde49a'), O),
+    leather: chrMat(chrRamp('#2a1410', '#4e211f', '#77362d', '#9a4c34', '#b86a44'), O),
+    cloth: chrMat(chrRamp('#1e0c22', '#3a1640', '#5a2462', '#7a3a80', '#9a5a9e'), O),
+    metal: chrMat(chrRamp('#24242a', '#44444c', '#686870', '#a2aaac', '#dae4e8'), O),
+    tusk: chrMat(chrRamp('#4a3a30', '#8a7262', '#b89c86', '#d8c0aa', '#f4e6d6'), O),
+    hair: chrMat(chrRamp('#3e4048', '#7e828c', '#aeb2ba', '#d4d8de', '#f4f6f8'), O),
+    flame: chrMat(chrRamp('#5a1008', '#a8200c', '#e04a14', '#ff7a2a', '#ffb24a'), Object.assign({ t: [-0.4, 0, 0.5] }, O)),
+  };
+})();
 
-const chrTrollNeck = [];
-for (let i = 0; i < 9; i++) {
-  const a = -0.9 + (i / 8) * 1.8, big = i === 4;
-  chrTrollNeck.push(chrP('chest', big ? 'cone' : 'ell', [Math.sin(a) * 15, 8.5 - Math.cos(a) * 2.5 - (big ? 2 : 0), Math.cos(a) * 11.5], big ? [1.6, 3.2, 1.6] : [1.2, 2.2, 1.0], 'bone', 1, { rot: big ? [Math.PI, 0, 0] : [0.5, a, 0] }));
+// a spiked wheel facing the camera (front / back views) or seen edge-on (side)
+function chrTrollWheel(edge) {
+  const sh = [];
+  const n = 8, R = 11.5;
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * TAU + 0.2, c = Math.cos(a), s = Math.sin(a), ex = edge ? 0.42 : 1;
+    const bx = c * (R - 1.5) * ex, by = s * (R - 1.5), tx = c * (R + 5.5) * ex, ty = s * (R + 5.5);
+    const px = -s * 3.2 * ex, py = c * 3.2;
+    sh.push(chrPoly([[bx + px, by + py], [tx, ty], [bx - px, by - py]], 'flame', { bev: 1.2 }));
+  }
+  sh.push(chrE(0, 0, R * (edge ? 0.42 : 1), R, 'metal'));
+  if (!edge) {
+    sh.push(chrE(0, 0, 7, 7, 'red', { g: 1, ln: true }));
+    sh.push(chrE(0, 0, 3.4, 3.4, 'metal', { g: 2, ln: true, pat: () => -1 }));
+  } else sh.push(chrE(0, 0, 2.6, 7, 'red', { g: 1, ln: true }));
+  return sh;
 }
+
+const CHR_TROLL_SPIRAL = chrD(-6, -6, [
+  'gggggggggg',
+  'g........g',
+  'g.gggggg.g',
+  'g.g....g.g',
+  'g.g.gg.g.g',
+  'g.g.g..g.g',
+  'g.g.gggg.g',
+  'g.g......g',
+  'g.gggggggg',
+], { g: ['gold', 3] });
+
+function chrTrollViews() {
+  const leg = (n, x, sgn, z, dark) => ({
+    n, p: null, at: [x, -30], z,
+    sh: [
+      chrCap(0, 0, sgn * 2, 15, 10.4, 8.8, 'skin', { pat: () => (dark ? -1 : 0) }),
+      chrB(sgn * 3, 23, 10.8, 7.6, 4, 'leather', { pat: (u, v) => (v > 0.55 ? -1 : dark ? -1 : 0) }),
+      chrB(sgn * 3, 17.4, 11.2, 2.4, 1.4, 'leather', { pat: () => 1 }),
+    ],
+  });
+  const arm = (n, x, sgn, z, opt = {}) => ({
+    n, p: 'body', at: [x, -30], z,
+    sh: [
+      chrCap(0, 0, sgn * 6, 16, 12.2, 10.4, 'skin', { pat: () => (opt.dark ? -1 : 0) }),
+      chrCap(sgn * 6, 16, sgn * 8, 29, 10.4, 9, 'skin', { pat: (u, v) => (u > 0.4 ? (((u * 6) | 0) % 2 ? 'red' : 'gold') : opt.dark ? -1 : 0) }),
+      chrE(sgn * 9, 34, 8.8, 7.8, 'skin', { pat: () => (opt.dark ? -1 : 0) }),
+    ],
+  });
+  const wheel = (p, sgn, z, edge) => ({ n: p === 'armR' || p === 'armN' ? 'wheelR' : 'wheelL', p, at: [sgn * 11, 34], z, sh: chrTrollWheel(edge) });
+  const belt = [
+    chrB(0, -2, 20, 4.6, 2.6, 'red', { pat: (u, v, lx) => (Math.abs(v) < 0.35 && ((lx + 40) % 6) < 2 ? 'gold' : 0) }),
+  ];
+  const buckle = chrD(-4, -6, ['..gggg..', '.gGGGGg.', 'gGgggGGg', 'gGg..gGg', 'gGg..gGg', 'gGGggGGg', '.gGGGGg.', '..gggg..'], { g: ['gold', 1], G: ['gold', 3] });
+  const loinFront = chrPoly([[-8.5, 1], [8.5, 1], [6, 25], [0, 28], [-6, 25]], 'red', { bev: 1.6, pat: (u, v) => (Math.abs(u) > 0.72 || v > 0.86 ? 'gold' : (Math.abs(u) < 0.2 && v > -0.3 && v < 0.6) ? 'gold' : 0) });
+  const head = (view) => {
+    const side = view === 'side', back = view === 'back';
+    const sh = [];
+    // ears
+    for (const sg of side ? [-1] : [-1, 1]) {
+      sh.push(chrPoly([[sg * 9, -12], [sg * 25, -21], [sg * 22, -15], [sg * 10, -4]].map(([x, y]) => side ? [x * 0.7 - 3, y] : [x, y]), 'skin', { bev: 1.6, pat: (u, v) => (!back && Math.abs(v) < 0.25 && Math.abs(u) < 0.6 ? -1 : 0) }));
+    }
+    sh.push(chrE(side ? 1 : 0, -9, side ? 11 : 12.4, 12.4, 'skin'));
+    // mohawk: a fan of spikes over the crown
+    const mx = side ? -1 : 0;
+    sh.push(chrPoly(side
+      ? [[-12, -12], [-15, -20], [-9, -19], [-9, -28], [-3, -24], [-1, -33], [3, -25], [7, -28], [6, -18], [10, -17], [6, -12]]
+      : [[mx - 4.5, -14], [mx - 6, -24], [mx - 2.4, -22], [mx, -34], [mx + 2.4, -22], [mx + 6, -24], [mx + 4.5, -14]], 'red', { bev: 1.6, pat: (u, v, lx) => (((lx + 40) % 3) < 1 ? -1 : 0) }));
+    if (!back) {
+      const fx = side ? 7 : 0;
+      sh.push(chrE(fx, -4, side ? 6 : 7.5, 5.6, 'skin', { g: 1 }));
+      sh.push(chrE(fx + (side ? 4 : 0), -7.5, 3.6, 3, 'skin', { g: 2, ln: true }));
+      // tusks
+      for (const sg of side ? [1] : [-1, 1]) sh.push(chrCap(fx + sg * 5.5 + (side ? -2 : 0), -1, fx + sg * 8 + (side ? -1 : 0), -9, 1.6, 0.9, 'tusk', { g: 3 }));
+      // moustache and beard
+      sh.push(chrPoly(side ? [[fx - 1, -5], [fx + 6, -5.5], [fx + 4, 6], [fx + 1, 10], [fx - 1, 2]]
+        : [[-6, -5.5], [0, -4], [6, -5.5], [9, 4], [7, 11], [4, 2], [0, 0], [-4, 2], [-7, 11], [-9, 4]], 'hair', { bev: 1.4, g: 4 }));
+      sh.push(chrPoly(side ? [[fx - 2, 0], [fx + 3, 1], [fx + 1, 12], [fx - 2, 8]] : [[-4, 1], [4, 1], [3, 12], [0, 15], [-3, 12]], 'cloth', { bev: 1.2, g: 5 }));
+    }
+    return sh;
+  };
+  const eyes = chrD(-6, -14, ['BB.......BB', '.yyy...yyy.', '.yPy...yPy.'], { B: '#1a1424', y: '#f2c838', P: '#2a1006' });
+  const eyeSide = chrD(5, -14, ['BBB', 'yyP', '.yy'], { B: '#1a1424', y: '#f2c838', P: '#2a1006' });
+  const front = {
+    parts: [
+      leg('legL', -11, -1, 1), leg('legR', 11, 1, 1),
+      { n: 'hips', p: null, at: [0, -30], z: 0.5, sh: [chrPoly([[-17, 0], [17, 0], [14, 18], [-14, 18]], 'cloth', { bev: 1 })] },
+      { n: 'body', p: 'hips', at: [0, -4], z: 3, sh: [chrE(0, -17, 25.5, 19, 'skin'), chrE(-10, -23, 12, 8, 'skin', { g: 1, ln: true }), chrE(10, -23, 12, 8, 'skin', { g: 1, ln: true })], dc: [chrD(-4, -14, ['oo..oo', '......', 'oo..oo', '......', 'oo..oo'], { o: ['skin', 1] })] },
+      { n: 'belt', p: 'hips', at: [0, 0], z: 4, sh: [...belt, loinFront], dc: [buckle] },
+      { n: 'strap', p: 'body', at: [0, 0], z: 5, sh: [chrCap(15, -34, -17, -4, 2.6, 2.6, 'leather', { pat: (u) => (((u * 10) | 0) % 3 === 0 ? 1 : 0) })] },
+      arm('armR', -27, -1, 6), arm('armL', 27, 1, 6),
+      { n: 'pad', p: 'body', at: [22, -30], z: 7, sh: [chrE(0, 0, 12, 10.4, 'red'), chrE(0, 0, 9.4, 7.8, 'red', { g: 1, ln: true })], dc: [CHR_TROLL_SPIRAL] },
+      wheel('armR', -1, 8), wheel('armL', 1, 8),
+      { n: 'head', p: 'body', at: [0, -30], z: 9, sh: head('front'), dc: [eyes] },
+    ],
+    pts: { top: ['head', 0, -30], hand: ['armR', -9, 35], chest: ['body', 0, -18] },
+  };
+  const back = {
+    parts: [
+      leg('legL', 11, 1, 1), leg('legR', -11, -1, 1),
+      { n: 'hips', p: null, at: [0, -30], z: 5, sh: [chrPoly([[-15, 0], [15, 0], [12, 22], [6, 18], [2, 25], [-4, 19], [-10, 24], [-13, 16]], 'cloth', { bev: 1.4 })] },
+      { n: 'body', p: 'hips', at: [0, -4], z: 3, sh: [chrE(0, -18, 25.5, 19.5, 'skin'), chrCap(0, -34, 0, -4, 1.4, 1.4, 'skin', { g: 1, ln: true, pat: () => -1 })] },
+      { n: 'belt', p: 'hips', at: [0, 0], z: 4, sh: belt, dc: [chrD(-7, -4, ['ggg.ggg.ggg.ggg'], { g: ['gold', 3] })] },
+      { n: 'strap', p: 'body', at: [0, 0], z: 5, sh: [chrCap(-15, -34, 17, -4, 2.6, 2.6, 'leather')] },
+      arm('armR', 27, 1, 6), arm('armL', -27, -1, 6),
+      { n: 'pad', p: 'body', at: [-22, -30], z: 7, sh: [chrE(0, 0, 12, 10.4, 'red'), chrE(0, 0, 9.4, 7.8, 'red', { g: 1, ln: true })] },
+      wheel('armR', 1, 8), wheel('armL', -1, 8),
+      { n: 'head', p: 'body', at: [0, -30], z: 9, sh: head('back') },
+    ],
+    pts: { top: ['head', 0, -30], hand: ['armR', 9, 35], chest: ['body', 0, -18] },
+  };
+  const side = {
+    parts: [
+      Object.assign(arm('armF', -6, 1, 0, { dark: true }), { n: 'armF' }),
+      { n: 'wheelL', p: 'armF', at: [11, 34], z: 0.5, sh: chrTrollWheel(true) },
+      leg('legF', -6, 1, 1, true), leg('legN', 6, 1, 2),
+      { n: 'hips', p: null, at: [0, -30], z: 2.5, sh: [chrPoly([[-14, 0], [6, 0], [2, 20], [-6, 24], [-13, 18]], 'cloth', { bev: 1 })] },
+      { n: 'body', p: 'hips', at: [0, -4], z: 3, sh: [chrE(0, -17, 19.5, 19.5, 'skin', { rot: 10 }), chrE(8, -22, 10, 8, 'skin', { g: 1, ln: true })] },
+      { n: 'belt', p: 'hips', at: [0, 0], z: 4, sh: [chrB(0, -2, 14, 4.6, 2.6, 'red', { pat: (u, v, lx) => (Math.abs(v) < 0.35 && ((lx + 40) % 6) < 2 ? 'gold' : 0) }), chrPoly([[6, 1], [13, 1], [12, 22], [9, 25], [6, 22]], 'red', { bev: 1.4, pat: (u) => (Math.abs(u) > 0.6 ? 'gold' : 0) })] },
+      { n: 'strap', p: 'body', at: [0, 0], z: 5, sh: [chrCap(-6, -34, 9, -6, 2.6, 2.6, 'leather')] },
+      { n: 'head', p: 'body', at: [10, -29], z: 8.5, sh: head('side'), dc: [eyeSide] },
+      Object.assign(arm('armN', -2, 1, 7), { n: 'armN' }),
+      { n: 'pad', p: 'body', at: [-2, -31], z: 6.5, sh: [chrE(0, 0, 10, 10, 'red'), chrE(0, 0, 7.4, 7.6, 'red', { g: 1, ln: true })], dc: [chrD(-4, -4, ['gggggggg', 'g......g', 'g.gggg.g', 'g.g..g.g', 'g.g.gg.g', 'g.g....g', 'g.gggggg'], { g: ['gold', 3] })] },
+      { n: 'wheelR', p: 'armN', at: [11, 34], z: 8, sh: chrTrollWheel(true) },
+    ],
+    pts: { top: ['head', 0, -30], hand: ['armN', 9, 35], chest: ['body', 6, -18] },
+  };
+  return { front, back, side };
+}
+
+const chrTrollAnims = {
+  idle: {
+    n: 8,
+    fn(t, P) {
+      const b = chrS(t), sg = P.view === 'back' ? -1 : 1;
+      P.s.body = [1 + 0.012 * b, 1 + 0.025 * b];
+      P.o.head = [0, b > 0.3 ? -1 : 0];
+      P.r.armR = sg * (4 + 3 * b); P.r.armL = -sg * (4 + 3 * b);
+      P.r.armN = -6 + 3 * b; P.r.armF = 6 - 3 * b;
+      P.r.wheelR = P.r.wheelL = t * 45;
+    },
+  },
+  walk: {
+    n: 8,
+    fn(t, P) {
+      const s = chrS(t), sg = P.view === 'back' ? -1 : 1;
+      P.root.y = Math.abs(s) > 0.6 ? -1 : 0;
+      if (P.view === 'side') {
+        P.r.legN = -22 * s; P.r.legF = 22 * s;
+        P.r.armN = -6 + 16 * s; P.r.armF = 6 - 16 * s; P.r.body = 6;
+      } else {
+        P.o.legL = [0, -2.4 * Math.max(0, s)]; P.o.legR = [0, -2.4 * Math.max(0, -s)];
+        P.root.x = 1.4 * s; P.r.hips = -2 * s;
+        P.r.armR = sg * (4 + 8 * s); P.r.armL = -sg * (4 - 8 * s);
+      }
+      P.r.wheelR = P.r.wheelL = t * 90;
+    },
+  },
+  // both fists up, then slammed down at 0.45
+  attack: {
+    n: 12, loop: false,
+    fn(t, P) {
+      const K = keys => chrKey(t, keys), sg = P.view === 'back' ? -1 : 1;
+      P.root.sy = K([[0, 1], [0.3, 1.05], [0.45, 0.9, ease.inQuad], [0.62, 0.95], [1, 1]]);
+      P.root.sx = K([[0, 1], [0.3, 0.97], [0.45, 1.08, ease.inQuad], [1, 1]]);
+      P.o.head = K([[0, [0, 0]], [0.3, [0, -3]], [0.45, [0, 3]], [1, [0, 0]]]);
+      if (P.view === 'side') {
+        P.r.armN = K([[0, -6], [0.3, 160, ease.outCubic], [0.45, -50, ease.inQuad], [0.62, -44], [1, -6]]);
+        P.r.armF = K([[0, 6], [0.3, 150, ease.outCubic], [0.45, -40, ease.inQuad], [1, 6]]);
+        P.r.body = K([[0, 6], [0.3, -8], [0.45, 18, ease.inQuad], [1, 6]]);
+        if (t > 0.08 && t < 0.7) { P.z.armN = 4; P.z.wheelR = 4; }
+      } else {
+        P.r.armR = sg * K([[0, 4], [0.3, 160, ease.outCubic], [0.45, 26, ease.inQuad], [0.62, 22], [1, 4]]);
+        P.r.armL = -sg * K([[0, 4], [0.3, 160, ease.outCubic], [0.45, 26, ease.inQuad], [0.62, 22], [1, 4]]);
+        P.o.armR = P.o.armL = K([[0, [0, 0]], [0.3, [0, -5]], [0.45, [0, 4]], [1, [0, 0]]]);
+      }
+      P.r.wheelR = P.r.wheelL = t * 220;
+    },
+  },
+  hit: {
+    n: 3, loop: false,
+    fn(t, P) {
+      const k = 1 - t, sg = P.view === 'back' ? -1 : 1;
+      P.root.y = -1.5 * k; P.o.head = [0, -2 * k];
+      P.r.armR = sg * (4 + 20 * k); P.r.armL = -sg * (4 + 20 * k);
+      if (P.view === 'side') { P.r.body = -10 * k; P.root.x = -2 * k; }
+    },
+  },
+};
 
 CHR.models.troll = {
-  size: [180, 168], anchor: [90, 140], k: 1.65,
-  mats: chrMats({
-    troll: chrMat(chrRamp('#0d1924', '#1b3946', '#2c606c', '#468a8e', '#80bfb4')),
-    fur: chrMat(chrRamp('#140c0a', '#33201a', '#5a3a28', '#83593a', '#ab8258')),
-    hairR: chrMat(chrRamp('#200608', '#4c0c12', '#88181c', '#c03424', '#ec6a3a')),
-    nail: chrMat(chrRamp('#2e2a20', '#6c6450', '#a89c80', '#d4caaa', '#f4ecd0')),
-  }),
-  joints: chrRig({ hip: 30, spine: 8, chest: 15, neck: 4, neckZ: 5, headY: 2.5, headZ: 4, shX: 19, shY: 2, upArm: 17, foreArm: 15.5, legX: 9.5, thigh: 12, shin: 12, armOut: 0.24, hunch: 0.3, elbow: -0.3, grip: 3, headRest: [-0.45, 0, 0] }),
-  parts: [
-    chrP('pelvis', 'ell', [0, 0, 0], [15, 9.5, 12.5], 'fur', 1, { pat: chrPat.fur }),
-    chrP('pelvis', 'cyl', [0, 7.2, 0.5], [15.6, 2.4, 13], 'leather', 1),
-    chrP('pelvis', 'ell', [0, 6.8, 13.4], [3.4, 3.6, 2.4], 'bone', 1, { pat: chrPat.skullBuckle }),
-    chrP('spine', 'ell', [0, 4, 5], [17, 15, 14], 'troll', 1, { pat: chrPat.trollBelly }),
-    chrP('chest', 'ell', [0, 1, 0], [21.5, 13, 13], 'troll', 1, { pat: chrPat.trollSkin }),
-    chrP('chest', 'ell', [0, 7, -6], [15, 9, 10], 'troll', 1, { pat: chrPat.trollSkin }),
-    ...chrTrollNeck,
-    chrP('head', 'ell', [0, 5.5, 0], [9, 9.5, 9], 'troll', 2, { pat: chrPat.trollSkin }),
-    chrP('head', 'ell', [0, 0.5, 4.5], [10, 5.6, 8], 'troll', 2, { pat: chrPat.trollJaw }),
-    chrP('head', 'ell', [0, 8.6, 5.6], [8.2, 2.6, 4.2], 'troll', 2),
-    chrP('head', 'ell', [3.5, 6.4, 7.6], [1.6, 1.3, 0.9], 'glowY', 2),
-    chrP('head', 'ell', [-3.5, 6.4, 7.6], [1.6, 1.3, 0.9], 'glowY', 2),
-    chrP('head', 'ell', [0, 4.6, 9.2], [2.6, 3, 2.4], 'troll', 2),
-    chrP('head', 'cone', [4.4, 3.2, 10.2], [1.3, 3.4, 1.3], 'nail', 2, { rot: [-0.25, 0, -0.2] }),
-    chrP('head', 'cone', [-4.4, 3.2, 10.2], [1.3, 3.4, 1.3], 'nail', 2, { rot: [-0.25, 0, 0.2] }),
-    chrP('head', 'cone', [9.4, 7, -0.5], [1.8, 4.8, 1.2], 'troll', 2, { rot: [0, 0, -1.25] }),
-    chrP('head', 'cone', [-9.4, 7, -0.5], [1.8, 4.8, 1.2], 'troll', 2, { rot: [0, 0, 1.25] }),
-    chrP('head', 'ell', [0, 13.5, -1.5], [2.2, 4.2, 7.4], 'hairR', 2, { pat: chrPat.fur }),
-    chrP('shL', 'rc', [1, 0, 0], [8.4, 6.4], 'troll', 3, { b: [0, -17, 0], pat: chrPat.trollSkin }),
-    chrP('elL', 'rc', [0, 0, 0], [7.2, 5.6], 'troll', 3, { b: [0, -14.5, 0.5], pat: chrPat.trollSkin }),
-    chrP('elL', 'cyl', [0, -10.5, 0.5], [6.4, 2.6, 6.4], 'iron', 3),
-    chrP('haL', 'ell', [0, -3.5, 1], [6.6, 6.2, 6.8], 'troll', 3, { pat: chrPat.toes }),
-    chrP('shR', 'rc', [-1, 0, 0], [8.4, 6.4], 'troll', 4, { b: [0, -17, 0], pat: chrPat.trollSkin }),
-    chrP('elR', 'rc', [0, 0, 0], [7.2, 5.6], 'troll', 4, { b: [0, -14.5, 0.5], pat: chrPat.trollSkin }),
-    chrP('elR', 'cyl', [0, -10.5, 0.5], [6.4, 2.6, 6.4], 'iron', 4),
-    chrP('haR', 'ell', [0, -3.5, 1], [6.6, 6.2, 6.8], 'troll', 4),
-    chrP('hipL', 'rc', [0, 0, 0], [9.2, 7.2], 'troll', 5, { b: [0, -12, 0], pat: chrPat.trollSkin }),
-    chrP('knL', 'rc', [0, 0, 0], [7.2, 6.2], 'troll', 5, { b: [0, -11, 0.6], pat: chrPat.trollSkin }),
-    chrP('ftL', 'ell', [0, -2.6, 3.2], [7, 4.2, 9.5], 'troll', 5, { pat: chrPat.toes }),
-    chrP('hipR', 'rc', [0, 0, 0], [9.2, 7.2], 'troll', 6, { b: [0, -12, 0], pat: chrPat.trollSkin }),
-    chrP('knR', 'rc', [0, 0, 0], [7.2, 6.2], 'troll', 6, { b: [0, -11, 0.6], pat: chrPat.trollSkin }),
-    chrP('ftR', 'ell', [0, -2.6, 3.2], [7, 4.2, 9.5], 'troll', 6, { pat: chrPat.toes }),
-    // the club
-    chrP('wpn', 'rc', [0, 0, -5], [2.4, 6.2], 'wood', 7, { b: [0, 0, 32], pat: chrPat.club }),
-    chrP('wpn', 'cyl', [0, 0, 21], [5.4, 1.6, 5.4], 'iron', 7, { rot: [Math.PI / 2, 0, 0] }),
-    chrP('wpn', 'cone', [5.6, 0, 27], [1.5, 3.4, 1.5], 'iron', 7, { rot: [0, 0, -Math.PI / 2] }),
-    chrP('wpn', 'cone', [-5.6, 0, 30], [1.5, 3.4, 1.5], 'iron', 7, { rot: [0, 0, Math.PI / 2] }),
-    chrP('wpn', 'cone', [0, 5.8, 26], [1.5, 3.4, 1.5], 'iron', 7),
-    chrP('wpn', 'cone', [0, -5.8, 31], [1.5, 3.4, 1.5], 'iron', 7, { rot: [Math.PI, 0, 0] }),
-    chrP('wpn', 'cone', [0, 0, 38.6], [1.6, 3.4, 1.6], 'iron', 7, { rot: [Math.PI / 2, 0, 0] }),
-  ],
-  pts: { top: ['head', [0, 16, 0]], hand: ['haR', [0, -4, 1]], chest: ['chest', [0, 0, 13]] },
-  anims: chrHumanAnims({ stride: 0.42, knee: 0.8, bob: 2.2, armSwing: 0.35, style: 'slam', heavy: 1, readyEl: -0.9, readySh: -0.2, wpnIdle: [0.5, 0, 0], offEl: -0.4, breath: 1.2, headDown: -0.15 }),
+  size: [170, 170], anchor: [85, 140],
+  mats: CHR_TROLL_MATS,
+  views: chrTrollViews(),
+  anims: chrTrollAnims,
 };
 
 // ---------------------------------------------------------------------------
-// the tree golem (elite): a bark giant with moss, glowing sap cracks and eyes,
-// branches with leaves growing from the head and shoulders, root feet
+// the tree giant (island-1 elite): a walking trunk with root feet, bark grain,
+// a wooden face with glowing eyes and a cyan gem, a beard of leaves, huge leaf
+// crowns on both shoulders and blocky wooden fists
 // ---------------------------------------------------------------------------
-Object.assign(chrPat, {
-  bark(x, y, z) {
-    const a = (Math.atan2(z, x) / TAU + 1) * 11 + chrNoise(y * 4, x * 2, 6) * 1.6;
-    if (a % 1 < 0.13) return -1;
-    if (chrNoise(x * 6 + 1, y * 6 + z * 3, 9) > 0.83) return 'moss';
-    if (z > 0.2 && Math.abs(chrNoise(x * 2 + 5, y * 0.9, 2) - 0.5) < 0.018 && chrNoise(x * 3, y * 3, 8) > 0.55) return 'sap';
-    return 0;
-  },
-  barkTop(x, y, z) {
-    if (y > 0.25 && chrNoise(x * 4, z * 4, 5) > 0.35) return 'moss';
-    return chrPat.bark(x, y, z);
-  },
-  golemFace(x, y, z) {
-    if (z < 0.2) return chrPat.bark(x, y, z);
-    for (const s of [-1, 1]) {
-      const ex = (x - s * 0.36) / 0.2, ey = (y - 0.2) / 0.17;
-      if (ex * ex + ey * ey < 1) return ex * ex + ey * ey < 0.35 ? 'sap' : 'hole';
-    }
-    const mx = x / 0.45, my = (y + 0.38) / 0.16;
-    if (mx * mx + my * my < 1) return 'hole';
-    return chrPat.bark(x, y, z);
-  },
-  leaves(x, y, z) {
-    const n = chrNoise(x * 6 + 7, y * 6 + z * 4, 13);
-    if (n > 0.7) return 1;
-    if (n < 0.25) return -1;
-    return 0;
-  },
-});
+const CHR_TREE_MATS = (() => {
+  const O = { out: '#1e0e08' };
+  return {
+    bark: chrMat(chrRamp('#24120a', '#4a2e16', '#69421e', '#8e5c2c', '#b88044'), O),
+    leaf: chrMat(chrRamp('#1c3010', '#3c5a18', '#5a8a26', '#7cb335', '#aee54c'), Object.assign({ t: [-0.25, 0.15, 0.6] }, O)),
+    moss: chrMat(chrRamp('#16260e', '#2c4a16', '#46701e', '#66912a', '#8cba3c'), O),
+    gem: chrMat(chrRamp('#0a4a44', '#0e7a6e', '#18b09c', '#25d4b6', '#9afcf0'), Object.assign({ t: [-0.6, -0.2, 0.3] }, O)),
+  };
+})();
+// bark: vertical grooves that wander a little
+const chrBarkPat = (u, v, lx, ly) => {
+  const g = (lx + valueNoise(ly * 0.18, lx * 0.1, 4) * 3 + 80) % 5.5;
+  if (g < 1) return -1;
+  if (g < 1.8 && valueNoise(lx * 0.3, ly * 0.3, 2) > 0.62) return -1;
+  return valueNoise(lx * 0.5 + 9, ly * 0.2, 7) > 0.78 ? 1 : 0;
+};
+const chrMossyBark = (u, v, lx, ly) => (v < -0.55 && valueNoise(lx * 0.3, ly * 0.4, 5) > 0.42 ? 'moss' : chrBarkPat(u, v, lx, ly));
+// leaves: a ragged rim and clumps of light and shade
+const chrLeafPat = (u, v, lx, ly) => {
+  const r = Math.hypot(u, v), a = Math.atan2(v, u);
+  if (r > 0.78 + valueNoise(a * 3.2 + 7, lx * 0.05, 3) * 0.3 - (Math.sin(a * 9) * 0.5 + 0.5) * 0.14) return 'x';
+  const n = valueNoise(lx * 0.34 + 3, ly * 0.34, 6);
+  return n > 0.7 ? 1 : n < 0.28 ? -1 : 0;
+};
 
-CHR.models.golem = {
-  size: [170, 168], anchor: [85, 136], k: 1.75,
-  mats: chrMats({
-    bark: chrMat(chrRamp('#140c08', '#2e1d12', '#4e3220', '#704a30', '#956a48')),
-    moss: chrMat(chrRamp('#0c1c0e', '#1c3a18', '#2e5e22', '#4e8a30', '#86b848')),
-    leaf: chrMat(chrRamp('#0a1c10', '#1a3a1a', '#2c6428', '#4e9636', '#8cc85a')),
-    sap: chrMat(chrRamp('#202008', '#606010', '#c8d838', '#f0ff80', '#ffffe0'), { flat: 3, rim: false }),
-  }),
-  joints: chrRig({ hip: 26, spine: 8, chest: 14, neck: 6, neckZ: 3, headY: 3, headZ: 2, shX: 19, shY: 1, upArm: 15, foreArm: 15, legX: 9, thigh: 11, shin: 11, armOut: 0.28, hunch: 0.14, elbow: -0.25, headRest: [-0.3, 0, 0], extra: [{ n: 'br1', p: 'head', at: [3, 9, -1] }, { n: 'br2', p: 'shL', at: [3, 6, -2] }, { n: 'br3', p: 'shR', at: [-2, 6, 1] }] }),
-  parts: [
-    chrP('pelvis', 'cyl', [0, 1, 0], [12, 7, 10], 'bark', 1, { pat: chrPat.bark }),
-    chrP('spine', 'ell', [0, 3, 3], [13.5, 11, 11], 'bark', 1, { pat: chrPat.bark }),
-    chrP('chest', 'cyl', [0, 1, 0], [17.5, 10, 13], 'bark', 1, { pat: chrPat.bark }),
-    chrP('chest', 'ell', [0, 10, -1], [17.5, 7.5, 13], 'bark', 1, { pat: chrPat.barkTop }),
-    chrP('chest', 'ell', [12, 12, -2], [7, 4, 7], 'moss', 1, { pat: chrPat.leaves }),
-    chrP('head', 'cyl', [0, 5, 0], [8, 6.5, 7.5], 'bark', 2, { pat: chrPat.golemFace }),
-    chrP('head', 'ell', [0, 11.2, 0], [8.2, 3, 7.6], 'moss', 2, { pat: chrPat.leaves }),
-    chrP('br1', 'rc', [0, 0, 0], [1.8, 1], 'bark', 2, { b: [5, 10, -2] }),
-    chrP('br1', 'rc', [2, 5, -1], [1.2, 0.8], 'bark', 2, { b: [-3, 9, -4] }),
-    chrP('br1', 'ell', [5, 11, -2], [5.5, 4.4, 5], 'leaf', 2, { pat: chrPat.leaves }),
-    chrP('br1', 'ell', [-3.4, 10, -4.4], [4.4, 3.6, 4.2], 'leaf', 2, { pat: chrPat.leaves }),
-    chrP('shL', 'rc', [1, 0, 0], [7.6, 6.2], 'bark', 3, { b: [0, -15, 0], pat: chrPat.bark }),
-    chrP('shL', 'ell', [2, 3.5, 0], [8, 4.5, 8], 'moss', 3, { pat: chrPat.leaves }),
-    chrP('br2', 'rc', [0, 0, 0], [1.4, 0.8], 'bark', 3, { b: [3, 8, -2] }),
-    chrP('br2', 'ell', [3.4, 9.6, -2.4], [4.2, 3.6, 4], 'leaf', 3, { pat: chrPat.leaves }),
-    chrP('elL', 'rc', [0, 0, 0], [7.4, 6.6], 'bark', 3, { b: [0, -13, 0.5], pat: chrPat.bark }),
-    chrP('haL', 'ell', [0, -3.5, 1], [7.4, 6.6, 7.4], 'bark', 3, { pat: chrPat.bark }),
-    chrP('haL', 'cone', [3, -9, 2], [1.6, 3.6, 1.6], 'bark', 3, { rot: [Math.PI, 0, 0.3] }),
-    chrP('haL', 'cone', [-2, -9.4, 2.4], [1.6, 3.6, 1.6], 'bark', 3, { rot: [Math.PI, 0, -0.2] }),
-    chrP('shR', 'rc', [-1, 0, 0], [7.6, 6.2], 'bark', 4, { b: [0, -15, 0], pat: chrPat.bark }),
-    chrP('shR', 'ell', [-2, 3.5, 0], [8, 4.5, 8], 'moss', 4, { pat: chrPat.leaves }),
-    chrP('br3', 'rc', [0, 0, 0], [1.2, 0.7], 'bark', 4, { b: [-3, 6, 1] }),
-    chrP('br3', 'ell', [-3.2, 7.4, 1.2], [3.4, 3, 3.4], 'leaf', 4, { pat: chrPat.leaves }),
-    chrP('elR', 'rc', [0, 0, 0], [7.4, 6.6], 'bark', 4, { b: [0, -13, 0.5], pat: chrPat.bark }),
-    chrP('haR', 'ell', [0, -3.5, 1], [7.4, 6.6, 7.4], 'bark', 4, { pat: chrPat.bark }),
-    chrP('haR', 'cone', [-3, -9, 2], [1.6, 3.6, 1.6], 'bark', 4, { rot: [Math.PI, 0, -0.3] }),
-    chrP('haR', 'cone', [2, -9.4, 2.4], [1.6, 3.6, 1.6], 'bark', 4, { rot: [Math.PI, 0, 0.2] }),
-    chrP('hipL', 'rc', [0, 0, 0], [8.6, 7.2], 'bark', 5, { b: [0, -11, 0], pat: chrPat.bark }),
-    chrP('knL', 'rc', [0, 0, 0], [7.2, 7.8], 'bark', 5, { b: [0, -10, 0.5], pat: chrPat.bark }),
-    chrP('ftL', 'ell', [0, -2.5, 2.5], [8.4, 4, 9], 'bark', 5, { pat: chrPat.bark }),
-    chrP('ftL', 'cone', [5, -3, 7], [1.6, 4, 1.6], 'bark', 5, { rot: [1.9, 0, -0.6] }),
-    chrP('ftL', 'cone', [-4, -3, 8], [1.5, 4, 1.5], 'bark', 5, { rot: [1.9, 0, 0.5] }),
-    chrP('hipR', 'rc', [0, 0, 0], [8.6, 7.2], 'bark', 6, { b: [0, -11, 0], pat: chrPat.bark }),
-    chrP('knR', 'rc', [0, 0, 0], [7.2, 7.8], 'bark', 6, { b: [0, -10, 0.5], pat: chrPat.bark }),
-    chrP('ftR', 'ell', [0, -2.5, 2.5], [8.4, 4, 9], 'bark', 6, { pat: chrPat.bark }),
-    chrP('ftR', 'cone', [4, -3, 8], [1.5, 4, 1.5], 'bark', 6, { rot: [1.9, 0, -0.5] }),
-    chrP('ftR', 'cone', [-5, -3, 7], [1.6, 4, 1.6], 'bark', 6, { rot: [1.9, 0, 0.6] }),
-  ],
-  pts: { top: ['head', [0, 20, 0]], hand: ['haR', [0, -4, 1]], chest: ['chest', [0, 0, 13]] },
-  anims: chrHumanAnims({
-    stride: 0.36, knee: 0.7, bob: 2, armSwing: 0.3, style: 'fists', heavy: 1, readyEl: -0.4, offEl: -0.4, breath: 1, headDown: 0.05,
-    idleX(t, P) { P.j.br1 = [0.06 * chrS(t), 0, 0.05 * chrC(t)]; P.j.br2 = [0.05 * chrS(t, 0.3), 0, 0]; P.j.br3 = [0.05 * chrS(t, 0.6), 0, 0]; },
-    walkX(t, P) { P.j.br1 = [0.12 * chrS(t * 2), 0, 0.08 * chrC(t)]; P.j.br2 = [0.1 * chrS(t * 2, 0.2), 0, 0]; P.j.br3 = [0.1 * chrS(t * 2, 0.5), 0, 0]; },
-  }),
+function chrTreeViews() {
+  const leg = (n, x, sgn, z, dark) => ({
+    n, p: null, at: [x, -34], z,
+    sh: [
+      chrCap(0, 0, sgn * 3, 24, 9.4, 7.4, 'bark', { pat: (u, v, lx, ly) => (dark ? -1 : chrBarkPat(u, v, lx, ly)) }),
+      chrE(sgn * 4, 29.5, 10.5, 5, 'bark', { pat: () => (dark ? -1 : 0) }),
+      chrCap(sgn * 6, 30, sgn * 15, 33.5, 2.8, 1.4, 'bark'),
+      chrCap(sgn * 1, 31, sgn * -5, 34, 2.4, 1.3, 'bark'),
+    ],
+  });
+  const arm = (n, x, sgn, z, opt = {}) => ({
+    n, p: 'body', at: [x, -38], z,
+    sh: [
+      chrCap(0, 0, sgn * 6, 17, 8.8, 7.4, 'bark', { pat: (u, v, lx, ly) => (opt.dark ? -1 : chrBarkPat(u, v, lx, ly)) }),
+      chrCap(sgn * 6, 17, sgn * 8, 30, 7.4, 8, 'bark', { pat: (u, v, lx, ly) => (opt.dark ? -1 : chrBarkPat(u, v, lx, ly)) }),
+      chrB(sgn * 9, 37, 9.6, 8.4, 3.4, 'bark', { pat: () => (opt.dark ? -1 : 0) }),
+      chrE(sgn * 4, 15, 7, 5, 'leaf', { pat: chrLeafPat }),
+    ],
+    dc: [chrD(sgn * 9 - 6, 37, ['o..o..o..o', 'o..o..o..o'], { o: ['bark', 0] })],
+  });
+  const crown = (n, x, y, sgn, z, big) => ({
+    n, p: 'body', at: [x, y], z, r0: sgn * -16,
+    sh: [
+      chrCap(-sgn * 12, 12, sgn * 4, 0, 3.2, 2, 'bark'),
+      chrE(0, 0, big ? 25 : 23, big ? 18 : 16.5, 'leaf', { pat: chrLeafPat }),
+      chrE(sgn * 9, -11, 13.5, 10, 'leaf', { pat: chrLeafPat }),
+      chrE(-sgn * 10, -8, 11, 9, 'leaf', { pat: chrLeafPat }),
+    ],
+  });
+  const face = chrD(-8, -14, [
+    '.ooooo...ooooo.',
+    '..oooo...oooo..',
+    '..hhhh...hhhh..',
+    '..hcch...hcch..',
+    '...hh.....hh...',
+  ], { o: ['bark', 1], h: '#140804', c: '#7af8ec' });
+  const gem = chrD(-2, -21, ['..G..', '.GgG.', 'GgwgG', '.GgG.', '..G..'], { G: ['gem', 2], g: ['gem', 3], w: '#dcfff8' });
+  const beard = chrPoly([[-10, -3], [-5, -6], [0, -4], [5, -6], [10, -3], [9, 6], [4, 12], [0, 17], [-4, 12], [-9, 6]], 'leaf', { bev: 1.6, g: 2, pat: (u, v, lx, ly) => (valueNoise(lx * 0.4, ly * 0.4, 8) > 0.66 ? 1 : 0) });
+  const front = {
+    parts: [
+      leg('legL', -11, -1, 1), leg('legR', 11, 1, 1),
+      { n: 'body', p: null, at: [0, -34], z: 3, sh: [chrB(0, -22, 19, 24, 10, 'bark', { pat: chrMossyBark })] },
+      crown('crownL', -28, -54, -1, 2), crown('crownR', 28, -54, 1, 2),
+      arm('armR', -22, -1, 5), arm('armL', 22, 1, 5),
+      {
+        n: 'head', p: 'body', at: [0, -45], z: 6,
+        sh: [chrB(0, -10, 12.5, 12.5, 5.5, 'bark', { pat: chrMossyBark }), chrPoly([[-11, -16], [11, -16], [9, -12], [-9, -12]], 'bark', { bev: 1, g: 1, ln: true, pat: () => -1 }), beard],
+        dc: [Object.assign({}, face, { x: -7.5, y: -12 }), Object.assign({}, gem, { y: -22 })],
+      },
+    ],
+    pts: { top: ['head', 0, -24], hand: ['armR', -9, 37], chest: ['body', 0, -22] },
+  };
+  const back = {
+    parts: [
+      leg('legL', 11, 1, 1), leg('legR', -11, -1, 1),
+      { n: 'head', p: 'body', at: [0, -45], z: 2.5, sh: [chrB(0, -10, 11, 11.5, 5, 'bark', { pat: chrMossyBark })] },
+      { n: 'body', p: null, at: [0, -34], z: 3, sh: [chrB(0, -22, 19, 24, 10, 'bark', { pat: chrMossyBark })] },
+      arm('armR', 22, 1, 4), arm('armL', -22, -1, 4),
+      crown('crownL', 28, -54, 1, 6, true), crown('crownR', -28, -54, -1, 6, true),
+      { n: 'crownM', p: 'body', at: [0, -40], z: 7, sh: [chrE(0, 0, 13, 10, 'leaf', { pat: chrLeafPat })] },
+    ],
+    pts: { top: ['head', 0, -24], hand: ['armR', 9, 37], chest: ['body', 0, -22] },
+  };
+  const side = {
+    parts: [
+      crown('crownL', -14, -56, -1, 0),
+      arm('armF', -4, 1, 0.5, { dark: true }),
+      leg('legF', -6, 1, 1, true), leg('legN', 6, 1, 2),
+      { n: 'body', p: null, at: [0, -34], z: 3, sh: [chrB(0, -22, 13.5, 24, 8, 'bark', { pat: chrMossyBark })] },
+      {
+        n: 'head', p: 'body', at: [4, -45], z: 7,
+        sh: [chrB(0, -10, 9.5, 11.5, 5, 'bark', { pat: chrMossyBark }), chrPoly([[3, -3], [10, -4], [9, 6], [5, 14], [2, 6]], 'leaf', { bev: 1.6, g: 2 })],
+        dc: [chrD(3, -12, ['.ooo.', '..hc.', '..hh.'], { o: ['bark', 1], h: '#140804', c: '#7af8ec' }), chrD(5, -20, ['.G.', 'GgG', '.G.'], { G: ['gem', 2], g: ['gem', 4] })],
+      },
+      crown('crownR', -2, -56, 1, 5, true),
+      arm('armN', 2, 1, 6),
+    ],
+    pts: { top: ['head', 0, -24], hand: ['armN', 9, 37], chest: ['body', 6, -22] },
+  };
+  return { front, back, side };
+}
+
+const chrTreeAnims = {
+  idle: {
+    n: 8,
+    fn(t, P) {
+      const b = chrS(t), sg = P.view === 'back' ? -1 : 1;
+      P.r.crownL = 2.5 * b; P.r.crownR = -2.5 * chrS(t, 0.3); P.r.crownM = b;
+      P.s.body = [1, 1 + 0.015 * b];
+      P.r.armR = sg * (4 + 2 * b); P.r.armL = -sg * (4 + 2 * b); P.r.armN = -4 + 2 * b; P.r.armF = 4 - 2 * b;
+      P.o.head = [0, b > 0.4 ? -1 : 0];
+    },
+  },
+  walk: {
+    n: 8,
+    fn(t, P) {
+      const s = chrS(t), sg = P.view === 'back' ? -1 : 1;
+      P.root.y = Math.abs(s) > 0.6 ? -1 : 0;
+      P.r.crownL = 4 * s; P.r.crownR = -4 * s;
+      if (P.view === 'side') { P.r.legN = -18 * s; P.r.legF = 18 * s; P.r.armN = -4 + 14 * s; P.r.armF = 4 - 14 * s; P.r.body = 4; }
+      else {
+        P.o.legL = [0, -2.6 * Math.max(0, s)]; P.o.legR = [0, -2.6 * Math.max(0, -s)];
+        P.root.x = 1.4 * s; P.r.body = -2 * s;
+        P.r.armR = sg * (4 + 8 * s); P.r.armL = -sg * (4 - 8 * s);
+      }
+    },
+  },
+  // the fists come up together, then hammer down at 0.45
+  attack: {
+    n: 12, loop: false,
+    fn(t, P) {
+      const K = keys => chrKey(t, keys), sg = P.view === 'back' ? -1 : 1;
+      P.root.sy = K([[0, 1], [0.3, 1.05], [0.45, 0.9, ease.inQuad], [0.62, 0.96], [1, 1]]);
+      P.root.sx = K([[0, 1], [0.3, 0.97], [0.45, 1.08, ease.inQuad], [1, 1]]);
+      P.r.crownL = K([[0, 0], [0.3, -10], [0.45, 12], [0.7, -4], [1, 0]]); P.r.crownR = -P.r.crownL;
+      if (P.view === 'side') {
+        P.r.armN = K([[0, -4], [0.3, 165, ease.outCubic], [0.45, -46, ease.inQuad], [0.62, -40], [1, -4]]);
+        P.r.armF = K([[0, 4], [0.3, 155, ease.outCubic], [0.45, -36, ease.inQuad], [1, 4]]);
+        P.r.body = K([[0, 0], [0.3, -8], [0.45, 14, ease.inQuad], [1, 0]]);
+        if (t > 0.08 && t < 0.7) P.z.armN = 4;
+      } else {
+        P.r.armR = sg * K([[0, 4], [0.3, 165, ease.outCubic], [0.45, 24, ease.inQuad], [0.62, 20], [1, 4]]);
+        P.r.armL = -sg * K([[0, 4], [0.3, 165, ease.outCubic], [0.45, 24, ease.inQuad], [0.62, 20], [1, 4]]);
+        P.o.armR = P.o.armL = K([[0, [0, 0]], [0.3, [0, -5]], [0.45, [0, 4]], [1, [0, 0]]]);
+      }
+    },
+  },
+  hit: {
+    n: 3, loop: false,
+    fn(t, P) {
+      const k = 1 - t, sg = P.view === 'back' ? -1 : 1;
+      P.root.y = -1.5 * k; P.r.crownL = -8 * k; P.r.crownR = 8 * k;
+      P.r.armR = sg * (4 + 18 * k); P.r.armL = -sg * (4 + 18 * k);
+      if (P.view === 'side') { P.r.body = -8 * k; P.root.x = -2 * k; }
+    },
+  },
+};
+
+CHR.models.tree = {
+  size: [180, 170], anchor: [90, 140],
+  mats: CHR_TREE_MATS,
+  views: chrTreeViews(),
+  anims: chrTreeAnims,
 };
 
 // ---------------------------------------------------------------------------
-// the cursed girl: long red braid, green dress, white apron, freckles
+// the cursed girl: red braid with a green ribbon, freckles, green dress over a
+// white blouse, a white apron, little brown shoes
 // ---------------------------------------------------------------------------
-Object.assign(chrPat, {
-  girlFace(x, y, z, nx, ny, nz, f) {
-    if (z < 0.35) return 0;
-    for (const s of [-1, 1]) {
-      const ex = (x - s * 0.32) / 0.09, ey = (y - 0.02) / 0.16;
-      if (ex * ex + ey * ey < 1) return ey > 0.45 ? { m: 'hair', i: 0 } : ey > 0.1 && ex < 0 ? 'white' : 'eyeG';
-      if (Math.abs(y - 0.3) < 0.05 && Math.abs(x - s * 0.33) < 0.15) return { m: 'hair', i: 1 }; // brow
-      // freckles and blush
-      const fx = x - s * 0.36, fy = y + 0.2;
-      if (fx * fx + fy * fy < 0.02 && ((x * 23 + y * 17) % 1 + 1) % 1 < 0.3) return { m: 'skin', i: 1 };
-      if (fx * fx * 0.8 + fy * fy < 0.03) return { m: 'blush', d: 0 };
-    }
-    const my = y + 0.42;
-    if (f.mouth ? (x * x / 0.03 + my * my / 0.012 < 1) : (Math.abs(my) < 0.04 && Math.abs(x) < 0.13)) return 'hole';
-    return 0;
-  },
-  girlHair(x, y, z) {
-    // the face stays open
-    if (z > 0.25 && y < 0.42 && Math.abs(x) < 0.62) return 'x';
-    if (((Math.atan2(z, x) / TAU + 2) * 14 + y * 1.5) % 1 < 0.16) return -1;
-    return 0;
-  },
-  skirt(x, y, z) {
-    // apron panel in front, folds, a hem band
-    const a = Math.atan2(x, z);
-    if (y < -0.86) return 'trim';
-    if (Math.abs(a) < 0.62 && y > -0.75 && z > 0) return Math.abs(Math.abs(a) - 0.58) < 0.05 ? { m: 'apron', d: -1 } : 'apron';
-    if (((a / TAU + 1) * 16) % 1 < 0.14) return -1;
-    return 0;
-  },
-  bodice(x, y, z) {
-    if (z > 0.3 && Math.abs(x) < 0.3 && y < 0.5) {
-      // criss-cross laces
-      const u = ((y + 1) * 6) % 1;
-      if (Math.abs(Math.abs(x) - (u < 0.5 ? u : 1 - u) * 0.5) < 0.06) return 'trim';
-    }
-    if (y > 0.62) return 'blouse';
-    return 0;
-  },
-});
+const CHR_GIRL_MATS = (() => {
+  const O = { out: '#2a1214' };
+  return {
+    skin: chrMat(chrRamp('#7a3c2a', '#b4705a', '#d8907a', '#f2b898', '#ffd8bc'), O),
+    hair: chrMat(chrRamp('#3a0c0a', '#6a1a12', '#9a2a18', '#cc4a24', '#f07a3a'), O),
+    dress: chrMat(chrRamp('#0c1a14', '#163626', '#215a38', '#348050', '#56a46c'), O),
+    white: chrMat(chrRamp('#4a4652', '#8e8a98', '#c6c4ce', '#e8e6ee', '#ffffff'), O),
+    shoe: chrMat(chrRamp('#1c0e08', '#3a2014', '#5a3420', '#7a4a2c', '#9a6440'), O),
+    ribbon: chrMat(chrRamp('#0c1a14', '#163626', '#2a7044', '#46a060', '#80d090'), O),
+    stone: chrMat(chrRamp('#24222c', '#4c4a56', '#7c7a86', '#a8a6b0', '#d0ced6'), O),
+  };
+})();
+const CHR_GIRL_PAL = { B: '#3a0c0a', W: '#ffffff', G: '#2a7a48', P: '#14301e', f: ['skin', 1], M: '#8a2c2c', m: '#c05050' };
+
+function chrGirlViews() {
+  const skirt = front => chrPoly([[-6.5, -20], [6.5, -20], [12.5, -2], [-12.5, -2]], 'dress', { bev: 1.6, pat: (u, v, lx) => (v > 0.8 ? -1 : ((lx + 40) % 5 < 1 ? -1 : 0)) });
+  const arm = (n, x, z, dark) => ({ n, p: 'torso', at: [x, -8], z, sh: [chrE(0, 0.5, 3.4, 3.2, 'white'), chrCap(0, 2, 0, 9.5, 2.2, 1.9, 'skin', { pat: () => (dark ? -1 : 0) }), chrE(0, 11, 2.2, 2.1, 'skin', { pat: () => (dark ? -1 : 0) })] });
+  const front = {
+    parts: [
+      { n: 'shoes', p: null, at: [0, 0], z: 1, sh: [chrE(-3.4, -1.6, 3, 1.8, 'shoe'), chrE(3.4, -1.6, 3, 1.8, 'shoe')] },
+      { n: 'skirt', p: null, at: [0, 0], z: 2, sh: [skirt(), chrPoly([[-4.5, -19], [4.5, -19], [7.5, -4], [-7.5, -4]], 'white', { bev: 1.2, g: 1, ln: true })] },
+      { n: 'torso', p: null, at: [0, -19], z: 3, sh: [chrB(0, -5.5, 6.6, 5.8, 2.6, 'dress')], dc: [chrD(-1, -10, ['x.x', '.x.', 'x.x', '.x.', 'x.x'], { x: ['white', 3] })] },
+      arm('armR', -6.4, 4), arm('armL', 6.4, 4),
+      {
+        n: 'head', p: 'torso', at: [0, -11], z: 6,
+        sh: [
+          chrB(0, -8.4, 7.8, 8.2, 4.6, 'skin', { flat: 0.2 }),
+          chrB(0, -13.4, 8.6, 4, 3.4, 'hair', { g: 1, ln: true }),
+          chrB(-7.4, -6, 2, 6.6, 1.6, 'hair', { g: 1 }),
+          chrB(7.4, -6, 2, 6.6, 1.6, 'hair', { g: 1 }),
+        ],
+        dc: [
+          chrD(-6, -10, ['.BBB...BBB..', '.WGG...GGW..', '.WPG...GPW..', '..f.....f...', '.f.f...f.f..'], CHR_GIRL_PAL),
+          chrD(-1, -3, ['MM'], CHR_GIRL_PAL, { if: f => !f.mouth }),
+          chrD(-1, -3, ['MM', 'mm'], CHR_GIRL_PAL, { if: f => !!f.mouth }),
+        ],
+      },
+      { n: 'braid', p: 'head', at: [6, -4], z: 7, sh: [chrE(0, 0, 2.4, 2.4, 'hair'), chrE(0.6, 3.8, 2.2, 2.4, 'hair'), chrE(1, 7.4, 2, 2.2, 'hair'), chrE(1.2, 10, 1.8, 1.2, 'ribbon'), chrE(1.3, 12, 1.4, 1.6, 'hair')] },
+    ],
+    pts: { top: ['head', 0, -17], head: ['head', 0, -8] },
+  };
+  const back = {
+    parts: [
+      { n: 'shoes', p: null, at: [0, 0], z: 1, sh: [chrE(-3.4, -1.6, 3, 1.8, 'shoe'), chrE(3.4, -1.6, 3, 1.8, 'shoe')] },
+      { n: 'skirt', p: null, at: [0, 0], z: 2, sh: [skirt()], dc: [chrD(-1, -19, ['W.W', '.W.', 'W.W'], { W: ['white', 3] })] },
+      { n: 'torso', p: null, at: [0, -19], z: 3, sh: [chrB(0, -5.5, 6.6, 5.8, 2.6, 'dress')] },
+      arm('armR', 6.4, 4), arm('armL', -6.4, 4),
+      { n: 'head', p: 'torso', at: [0, -11], z: 6, sh: [chrB(0, -8.4, 8.4, 8.6, 4.8, 'hair')] },
+      { n: 'braid', p: 'head', at: [0, -2], z: 7, sh: [chrE(0, 0, 2.6, 2.6, 'hair'), chrE(0, 4, 2.4, 2.6, 'hair'), chrE(0, 8, 2.2, 2.4, 'hair'), chrE(0, 11, 2, 1.3, 'ribbon'), chrE(0, 13.2, 1.6, 1.8, 'hair')] },
+    ],
+    pts: { top: ['head', 0, -17], head: ['head', 0, -8] },
+  };
+  const side = {
+    parts: [
+      { n: 'braid', p: 'head', at: [-6, -5], z: 0, sh: [chrE(0, 0, 2.4, 2.4, 'hair'), chrE(-0.6, 3.8, 2.2, 2.4, 'hair'), chrE(-1, 7.4, 2, 2.2, 'hair'), chrE(-1.2, 10, 1.8, 1.2, 'ribbon'), chrE(-1.3, 12, 1.4, 1.6, 'hair')] },
+      { n: 'armF', p: 'torso', at: [-1, -8], z: 1, sh: [chrE(0, 0.5, 3, 3, 'white', { pat: () => -1 }), chrCap(0, 2, 0, 9.5, 2, 1.8, 'skin', { pat: () => -1 })] },
+      { n: 'shoes', p: null, at: [0, 0], z: 1, sh: [chrE(-1, -1.6, 3.4, 1.8, 'shoe'), chrE(3, -1.6, 3.4, 1.8, 'shoe')] },
+      { n: 'skirt', p: null, at: [0, 0], z: 2, sh: [chrPoly([[-5, -20], [5, -20], [9.5, -2], [-9.5, -2]], 'dress', { bev: 1.6, pat: (u, v) => (v > 0.8 ? -1 : 0) }), chrPoly([[3.5, -19], [5.5, -19], [9.2, -4], [5.8, -4]], 'white', { bev: 1, g: 1, ln: true })] },
+      { n: 'torso', p: null, at: [0, -19], z: 3, sh: [chrB(0.5, -5.5, 4.8, 5.8, 2.4, 'dress')] },
+      {
+        n: 'head', p: 'torso', at: [0.5, -11], z: 6,
+        sh: [chrB(0.5, -8.4, 7.4, 8.2, 4.4, 'skin', { flat: 0.2 }), chrB(-2.4, -9.6, 5.4, 7.4, 3.6, 'hair', { g: 1, ln: true }), chrB(1.4, -13.6, 6.4, 3.4, 2.4, 'hair', { g: 1, ln: true })],
+        dc: [chrD(3, -10, ['BBB.', '.GGW', '.PG.', '..f.', '.f.f'], CHR_GIRL_PAL), chrD(5, -3, ['M'], CHR_GIRL_PAL, { if: f => !f.mouth }), chrD(5, -3, ['M', 'm'], CHR_GIRL_PAL, { if: f => !!f.mouth })],
+      },
+      { n: 'armN', p: 'torso', at: [1, -8], z: 5, sh: [chrE(0, 0.5, 3.2, 3.2, 'white'), chrCap(0, 2, 0, 9.5, 2.1, 1.9, 'skin'), chrE(0, 11, 2.1, 2, 'skin')] },
+    ],
+    pts: { top: ['head', 0, -17], head: ['head', 0, -8] },
+  };
+  return { front, back, side };
+}
 
 CHR.models.girl = {
-  size: [64, 70], anchor: [32, 60],
-  mats: chrMats({
-    skin: chrMat(chrRamp('#3e2028', '#86504a', '#c88a74', '#efbe9c', '#ffe6cc')),
-    dress: chrMat(chrRamp('#0c1a14', '#163626', '#215a38', '#348050', '#5aa870')),
-    apron: chrMat(chrRamp('#3a3634', '#7c7670', '#c4beb4', '#e8e4dc', '#ffffff')),
-    blouse: chrMat(chrRamp('#3a3a44', '#82808c', '#cac8d0', '#ececf2', '#ffffff')),
-    hair: chrMat(chrRamp('#2a0a0c', '#5a1614', '#962a1c', '#cc4a26', '#f08040')),
-    trim: chrMat(chrRamp('#1c0e08', '#432818', '#6e4426', '#9a6a3c', '#c8985e')),
-    eyeG: chrMat(chrRamp('#0a1a12', '#14402a', '#2a7a48', '#4ab070', '#8ae0a0'), { flat: 1, rim: false }),
-    blush: chrMat(chrRamp('#3e2028', '#904e4a', '#d68676', '#f4b098', '#ffd6c4')),
-    ribbon: chrMat(chrRamp('#0c1a14', '#163626', '#2a7044', '#46a060', '#80d090')),
-  }),
+  size: [64, 72], anchor: [32, 60],
+  mats: CHR_GIRL_MATS,
   flags: { mouth: 0 },
-  joints: chrRig({
-    hip: 14.5, spine: 3.4, chest: 6.4, neck: 2.8, headY: 2.2, headZ: 0.4, shX: 4.6, shY: 1, upArm: 5.2, foreArm: 4.8, legX: 2.3, thigh: 6, shin: 6, armOut: 0.1,
-    extra: [{ n: 'braid', p: 'head', at: [0, 3.4, -4.6], rest: [0.35, 0, 0] }],
-  }),
-  parts: [
-    chrP('pelvis', 'cone', [0, -4.6, 0], [7.4, 9.4, 6.4], 'dress', 1, { pat: chrPat.skirt }),
-    chrP('spine', 'ell', [0, 2, 0.2], [4.2, 4.2, 3.4], 'dress', 1),
-    chrP('chest', 'ell', [0, -0.6, 0], [4.7, 4.6, 3.7], 'dress', 1, { pat: chrPat.bodice }),
-    chrP('neck', 'ell', [0, 0, 0.1], [1.7, 2, 1.7], 'skin', 2),
-    chrP('head', 'ell', [0, 4.6, 0.3], [5, 5.4, 4.8], 'skin', 2, { pat: chrPat.girlFace }),
-    chrP('head', 'ell', [0, 5.6, -0.9], [5.6, 5.8, 5.2], 'hair', 2, { pat: chrPat.girlHair }),
-    chrP('head', 'ell', [0, 8.2, 2.8], [4.4, 2, 2.6], 'hair', 2, { rot: [0.4, 0, 0] }),
-    chrP('head', 'ell', [4.2, 6, 1.6], [1.5, 3.4, 1.8], 'hair', 2),
-    chrP('head', 'ell', [-4.2, 6, 1.6], [1.5, 3.4, 1.8], 'hair', 2),
-    chrP('braid', 'ell', [0, -1, 0], [2, 2.2, 1.8], 'hair', 9),
-    chrP('braid', 'ell', [0, -4.4, -0.2], [1.8, 2.2, 1.6], 'hair', 9),
-    chrP('braid', 'ell', [0, -7.8, -0.4], [1.6, 2.1, 1.5], 'hair', 9),
-    chrP('braid', 'ell', [0, -11, -0.5], [1.4, 2, 1.3], 'hair', 9),
-    chrP('braid', 'ell', [0, -13.6, -0.5], [1.5, 1.2, 1.3], 'ribbon', 9),
-    chrP('braid', 'ell', [0, -15.4, -0.5], [1.1, 1.6, 1], 'hair', 9),
-    chrP('shL', 'ell', [0.4, -1.4, 0], [2.4, 2.8, 2.4], 'blouse', 3),
-    chrP('elL', 'rc', [0, 1, 0], [1.4, 1.2], 'skin', 3, { b: [0, -4.6, 0.2] }),
-    chrP('haL', 'ell', [0, -1, 0.3], [1.4, 1.6, 1.4], 'skin', 3),
-    chrP('shR', 'ell', [-0.4, -1.4, 0], [2.4, 2.8, 2.4], 'blouse', 4),
-    chrP('elR', 'rc', [0, 1, 0], [1.4, 1.2], 'skin', 4, { b: [0, -4.6, 0.2] }),
-    chrP('haR', 'ell', [0, -1, 0.3], [1.4, 1.6, 1.4], 'skin', 4),
-    chrP('ftL', 'ell', [0, -1, 1], [1.8, 1.3, 2.6], 'trim', 5),
-    chrP('ftR', 'ell', [0, -1, 1], [1.8, 1.3, 2.6], 'trim', 6),
-  ],
-  pts: { top: ['head', [0, 11, 0]], head: ['head', [0, 5, 0]] },
+  views: chrGirlViews(),
   anims: {
     // hands clasped in front, a slow sway
     idle: {
       n: 8,
       fn(t, P) {
-        const b = chrS(t), b2 = chrS(t, 0.2);
-        P.o.chest = [0, 0.25 * b, 0];
-        P.j.spine = [0.02, 0.04 * b2, 0.02 * b2];
-        P.j.head = [0.06 + 0.04 * b2, -0.06 * b2, 0.05 * b];
-        P.j.shL = [-0.45, 0, -0.32]; P.j.shR = [-0.45, 0, 0.32];
-        P.j.elL = [-1.15, 0.3, 0]; P.j.elR = [-1.15, -0.3, 0];
-        P.j.braid = [0.06 * chrS(t, 0.3), 0, 0.08 * b2];
-        P.t = [0, 0.15 * b, 0];
+        const b = chrS(t), sg = P.view === 'back' ? -1 : 1;
+        P.o.torso = [0, b > 0.4 ? 0.5 : 0]; P.o.head = [0, b > 0.4 ? 0.5 : 0];
+        P.r.armR = sg * -28; P.r.armL = sg * 28; P.o.armR = [sg * 1.5, 0]; P.o.armL = [-sg * 1.5, 0];
+        P.r.armN = -30; P.r.armF = -20;
+        P.r.braid = 6 * chrS(t, 0.25); P.r.head = 2 * chrS(t, 0.1);
       },
     },
-    // pleading: one hand reaching out, head tilting, mouth moving
+    // pleading: one hand reaching out, the head tilting, the mouth moving
     talk: {
       n: 8,
       fn(t, P) {
-        const b = chrS(t), b2 = chrS(t * 2);
-        P.j.spine = [0.06, 0.08 * b, 0];
-        P.j.head = [0.02 + 0.05 * b2, 0.12 * b, 0.1 * b];
-        P.j.shL = [-0.5, 0, -0.3]; P.j.elL = [-1.2, 0.3, 0];
-        P.j.shR = [-0.9 - 0.25 * Math.max(0, b), 0, -0.1]; P.j.elR = [-0.6 - 0.3 * b2, 0, 0];
-        P.j.braid = [0.08 * chrS(t, 0.25), 0, 0.1 * b];
-        P.f.mouth = (Math.floor(t * 8) % 2) ? 1 : 0;
+        const b = chrS(t), sg = P.view === 'back' ? -1 : 1;
+        P.r.armR = sg * (-28 + 50 * Math.max(0, b)); P.o.armR = [sg * 1.5, -1.5 * Math.max(0, b)];
+        P.r.armL = sg * 28; P.o.armL = [-sg * 1.5, 0];
+        P.r.armN = -30 - 40 * Math.max(0, b); P.r.armF = -20;
+        P.r.head = 5 * chrS(t, 0.2); P.r.braid = 8 * chrS(t, 0.35);
+        P.f.mouth = Math.floor(t * 8) % 2;
       },
     },
   },
 };
 
 // ---------------------------------------------------------------------------
-// the old miner: hard hat with a lamp, white beard, plaid shirt, overalls,
-// a pickaxe on the shoulder and a lantern in the other hand
+// the old miner: yellow hard hat with a lamp, bushy white beard, red nose,
+// plaid shirt under blue overalls, a pickaxe on the shoulder, a lantern
 // ---------------------------------------------------------------------------
-Object.assign(chrPat, {
-  plaid(x, y, z) {
-    const a = Math.atan2(z, x) / TAU;
-    const u = ((a + 2) * 10) % 1, v = ((y + 2) * 4) % 1;
-    if (u < 0.22 || v < 0.22) return u < 0.22 && v < 0.22 ? { m: 'shirt', i: 0 } : -1;
-    return 0;
-  },
-  overalls(x, y, z) {
-    // the bib over the chest with straps and brass buttons
-    if (z > 0.2 && Math.abs(x) < 0.5 && y < 0.55) {
-      if (Math.abs(Math.abs(x) - 0.36) < 0.08 && Math.abs(y - 0.4) < 0.08) return 'brass';
-      if (Math.abs(y + 0.1) < 0.04) return { m: 'denim', d: -1 };
-      return 'denim';
-    }
-    if (Math.abs(Math.abs(x) - 0.42) < 0.09 && y > 0.4) return 'denim';
-    return chrPat.plaid(x, y, z);
-  },
-  beard(x, y, z) {
-    const a = (x * 9 + 9) % 1;
-    if (a < 0.18 && y < 0.3) return -1;
-    return 0;
-  },
-  minerFace(x, y, z) {
-    if (z < 0.4) return 0;
-    for (const s of [-1, 1]) { const ex = (x - s * 0.33) / 0.1, ey = (y - 0.12) / 0.11; if (ex * ex + ey * ey < 1) return 'hole'; }
-    return 0;
-  },
-  helmet(x, y, z) {
-    if (Math.abs(y + 0.2) < 0.08) return -1;
-    return 0;
-  },
-});
+const CHR_MINER_MATS = (() => {
+  const O = { out: '#1c1210' };
+  return {
+    skin: chrMat(chrRamp('#7a3c22', '#b46a48', '#d48a62', '#f0ac82', '#ffcca8'), O),
+    nose: chrMat(chrRamp('#5a1418', '#8a2a2c', '#c0484a', '#e06a66', '#ff9a90'), O),
+    beard: chrMat(chrRamp('#5a5662', '#8e8a98', '#c4c2cc', '#e6e4ea', '#ffffff'), O),
+    helmet: chrMat(chrRamp('#4a3008', '#7a5410', '#b48420', '#e8b836', '#ffe27a'), O),
+    shirt: chrMat(chrRamp('#3a0c0c', '#6a1814', '#9a2a20', '#c44434', '#e06a52'), O),
+    denim: chrMat(chrRamp('#0c1424', '#18284a', '#283e70', '#3c5a96', '#6a88c0'), O),
+    boot: chrMat(chrRamp('#140c08', '#2a1a12', '#44281a', '#5e3a24', '#7a5032'), O),
+    metal: chrMat(chrRamp('#24242a', '#4a4a54', '#74747e', '#a6a8b2', '#dadce4'), O),
+    wood: chrMat(chrRamp('#2a160c', '#4a2c18', '#6e4426', '#8e5a34', '#a8703e'), O),
+    brass: chrMat(chrRamp('#3a2008', '#6a4214', '#a8742a', '#d8a848', '#fde49a'), O),
+    glow: chrMat(chrRamp('#8a6a10', '#d8b040', '#ffe27a', '#fff2b0', '#ffffff'), Object.assign({ t: [-2, -1.5, -1] }, O)),
+  };
+})();
+const chrPlaid = (u, v, lx, ly) => (((lx + 40) % 4 < 1) || ((ly + 40) % 4 < 1) ? -1 : 0);
+
+function chrMinerViews() {
+  const leg = (n, x) => ({ n, p: null, at: [x, -12], z: 1, sh: [chrB(0, 6, 4.4, 6.2, 2.4, 'denim', { pat: (u, v) => (v > 0.4 ? 'boot' : 0) })] });
+  const arm = (n, x, z) => ({ n, p: 'torso', at: [x, -11], z, sh: [chrCap(0, 0, 0, 9, 3.2, 2.9, 'shirt', { pat: chrPlaid }), chrE(0, 11, 3, 2.8, 'skin')] });
+  const pick = (p, at, r0, z) => ({ n: 'pick', p, at, r0, z, sh: [chrCap(0, 2, 0, -18, 1, 1, 'wood'), chrPoly([[-9, -18.5], [0, -21], [9, -18.5], [0, -17.4]], 'metal', { bev: 1 })] });
+  const lantern = (p, at, z) => ({
+    n: 'lantern', p, at, z,
+    sh: [chrCap(0, -3, 0, 0, 0.5, 0.5, 'metal'), chrB(0, 3, 2.6, 3.4, 1, 'glow'), chrB(0, -0.4, 3, 0.8, 0.4, 'brass'), chrB(0, 6.6, 3, 0.8, 0.4, 'brass')],
+  });
+  const hat = side => [
+    chrE(side ? -0.5 : 0, -12.5, side ? 8.2 : 8.6, 6.2, 'helmet', { g: 1, ln: true }),
+    chrB(side ? 0.5 : 0, -9.2, side ? 10 : 10.4, 1.4, 0.8, 'helmet', { g: 1 }),
+  ];
+  const front = {
+    parts: [
+      leg('legL', -4.4), leg('legR', 4.4),
+      { n: 'torso', p: null, at: [0, -12], z: 3, sh: [chrB(0, -7.6, 9.6, 7.8, 4, 'shirt', { pat: chrPlaid }), chrB(0, -5, 6.4, 5.6, 2, 'denim', { g: 1, ln: true })], dc: [chrD(-5, -11, ['o.........o'], { o: ['brass', 3] })] },
+      arm('armR', -10.2, 4), arm('armL', 10.2, 4),
+      pick('armR', [0, 11], 0, 5),
+      lantern('armL', [0, 13], 5),
+      {
+        n: 'head', p: 'torso', at: [0, -14], z: 6,
+        sh: [
+          chrB(0, -7, 8, 7.8, 4.4, 'skin', { flat: 0.2 }),
+          chrPoly([[-8, -4], [-4, -2], [0, -3], [4, -2], [8, -4], [7, 3], [3, 8], [0, 10], [-3, 8], [-7, 3]], 'beard', { bev: 1.6, g: 2, ln: true }),
+          chrE(0, -4.2, 2.3, 2, 'nose', { g: 3 }),
+          ...hat(false),
+        ],
+        dc: [chrD(-5, -8, ['www.www', '.P...P.'], { w: ['beard', 4], P: '#24140c' }), chrD(-1.5, -11.2, ['.LL.', 'LllL'], { L: ['brass', 2], l: '#fff6c0' })],
+      },
+    ],
+    pts: { top: ['head', 0, -19], lamp: ['head', 0, -11], lantern: ['lantern', 0, 3] },
+  };
+  const back = {
+    parts: [
+      leg('legL', 4.4), leg('legR', -4.4),
+      lantern('armL', [0, 13], 2),
+      { n: 'torso', p: null, at: [0, -12], z: 3, sh: [chrB(0, -7.6, 9.6, 7.8, 4, 'shirt', { pat: chrPlaid }), chrB(0, -3.4, 7, 4, 2, 'denim', { g: 1, ln: true }), chrCap(-4, -10, -2.6, -4, 1.3, 1.3, 'denim'), chrCap(4, -10, 2.6, -4, 1.3, 1.3, 'denim')] },
+      arm('armR', 10.2, 4), arm('armL', -10.2, 4),
+      pick('armR', [0, 11], 0, 2),
+      { n: 'head', p: 'torso', at: [0, -14], z: 6, sh: [chrB(0, -7, 8, 7.8, 4.4, 'beard'), ...hat(false)] },
+    ],
+    pts: { top: ['head', 0, -19], lamp: ['head', 0, -11], lantern: ['lantern', 0, 3] },
+  };
+  const side = {
+    parts: [
+      { n: 'armF', p: 'torso', at: [-1, -11], z: 0, sh: [chrCap(0, 0, 0, 9, 2.8, 2.6, 'shirt', { pat: () => -1 }), chrE(0, 11, 2.7, 2.6, 'skin', { pat: () => -1 })] },
+      lantern('armF', [0, 13], 0.5),
+      { n: 'legF', p: null, at: [-1.6, -12], z: 1, sh: [chrB(0, 6, 3.8, 6.2, 2.2, 'denim', { pat: (u, v) => (v > 0.4 ? { m: 'boot', d: -1 } : -1) }), chrB(1.6, 11, 3.4, 1.2, 1, 'boot', { pat: () => -1 })] },
+      { n: 'legN', p: null, at: [1.4, -12], z: 2, sh: [chrB(0, 6, 3.8, 6.2, 2.2, 'denim', { pat: (u, v) => (v > 0.4 ? 'boot' : 0) }), chrB(1.6, 11, 3.4, 1.2, 1, 'boot')] },
+      { n: 'torso', p: null, at: [0, -12], z: 3, sh: [chrB(0.4, -7.6, 6.8, 7.8, 3.6, 'shirt', { pat: chrPlaid }), chrB(2, -5, 4.4, 5.6, 2, 'denim', { g: 1, ln: true })] },
+      {
+        n: 'head', p: 'torso', at: [0.6, -14], z: 6,
+        sh: [
+          chrB(0.4, -7, 7.6, 7.8, 4.2, 'skin', { flat: 0.2 }),
+          chrPoly([[0, -4], [8, -4], [8, 3], [4, 9], [1, 6]], 'beard', { bev: 1.6, g: 2, ln: true }),
+          chrE(8, -4.6, 2.2, 2, 'nose', { g: 3 }),
+          ...hat(true),
+        ],
+        dc: [chrD(4, -8, ['www', '..P'], { w: ['beard', 4], P: '#24140c' }), chrD(-2, -9, ['ss', 'sS', 'ss'], { s: ['skin', 3], S: ['skin', 1] }), chrD(8, -11.4, ['L.', 'lL'], { L: ['brass', 2], l: '#fff6c0' }, { free: true })],
+      },
+      { n: 'armN', p: 'torso', at: [0.6, -11], z: 5, sh: [chrCap(0, 0, 0, 9, 3, 2.8, 'shirt', { pat: chrPlaid }), chrE(0, 11, 2.9, 2.8, 'skin')] },
+      pick('armN', [0, 11], 10, 4),
+    ],
+    pts: { top: ['head', 0, -19], lamp: ['head', 9, -10.5], lantern: ['lantern', 0, 3] },
+  };
+  return { front, back, side };
+}
 
 CHR.models.miner = {
-  size: [74, 76], anchor: [37, 62],
-  mats: chrMats({
-    skin: chrMat(chrRamp('#3a1c1a', '#804434', '#c0745a', '#e6a480', '#ffd2b2')),
-    nose: chrMat(chrRamp('#3a1018', '#7a2a2c', '#c0504a', '#e47c6a', '#ffb09a')),
-    denim: chrMat(chrRamp('#0c1424', '#18284a', '#283e70', '#3c5a96', '#6a88c0')),
-    shirt: chrMat(chrRamp('#200a0c', '#4a1416', '#7e2220', '#ad3a2e', '#d86a52')),
-    beard: chrMat(chrRamp('#4a4650', '#8a8692', '#c8c6cc', '#eeedf0', '#ffffff')),
-    helmet: chrMat(chrRamp('#2a1e08', '#5e4614', '#a07a22', '#d4a83a', '#f6d870'), { spec: '#fffbe0', specT: 0.94 }),
-  }),
-  joints: chrRig({ hip: 15, spine: 3.5, chest: 7, neck: 2.4, headY: 2.2, headZ: 0.8, shX: 6.4, shY: 1.2, upArm: 5.8, foreArm: 5.4, legX: 3, thigh: 6, shin: 6, armOut: 0.15, hunch: 0.1, headRest: [-0.32, 0, 0] }),
-  parts: [
-    chrP('pelvis', 'ell', [0, 0.6, 0], [5.8, 4, 4.6], 'denim', 1),
-    chrP('pelvis', 'cyl', [0, 3, 0.2], [5.9, 0.9, 4.8], 'leather', 1),
-    chrP('spine', 'ell', [0, 2.6, 0.6], [6.2, 5.6, 4.9], 'shirt', 1, { pat: chrPat.overalls }),
-    chrP('chest', 'ell', [0, -0.6, 0], [6.8, 5.2, 4.8], 'shirt', 1, { pat: chrPat.overalls }),
-    chrP('neck', 'ell', [0, 0, 0.2], [2.4, 2.2, 2.2], 'skin', 2),
-    chrP('head', 'ell', [0, 4.6, 0.3], [5.3, 5.5, 5], 'skin', 2, { pat: chrPat.minerFace }),
-    chrP('head', 'ell', [0, 4.2, 5], [1.9, 1.7, 1.7], 'nose', 2),
-    chrP('head', 'ell', [0, 1.4, 3.6], [4.8, 4.6, 3.4], 'beard', 2, { pat: chrPat.beard }),
-    chrP('head', 'ell', [1.8, 3.2, 4.6], [2.2, 1, 1.2], 'beard', 2, { rot: [0, 0, -0.35] }),
-    chrP('head', 'ell', [-1.8, 3.2, 4.6], [2.2, 1, 1.2], 'beard', 2, { rot: [0, 0, 0.35] }),
-    chrP('head', 'ell', [1.9, 6.4, 4.4], [1.6, 0.8, 1], 'beard', 2),
-    chrP('head', 'ell', [-1.9, 6.4, 4.4], [1.6, 0.8, 1], 'beard', 2),
-    chrP('head', 'ell', [0, 8.2, -0.6], [5.3, 4, 5.3], 'helmet', 2, { pat: chrPat.helmet }),
-    chrP('head', 'cyl', [0, 7.2, -0.2], [6.2, 0.55, 6], 'helmet', 2),
-    chrP('head', 'cyl', [0, 9.2, 4.5], [1.4, 1.1, 1.4], 'brass', 2, { rot: [Math.PI / 2, 0, 0] }),
-    chrP('head', 'ell', [0, 9.2, 5.7], [1.1, 1.1, 0.5], 'glowY', 2),
-    chrP('shL', 'rc', [0, 0, 0], [2.3, 1.9], 'shirt', 3, { b: [0, -5.8, 0], pat: chrPat.plaid }),
-    chrP('elL', 'rc', [0, 0, 0], [1.9, 1.6], 'skin', 3, { b: [0, -5, 0.3] }),
-    chrP('haL', 'ell', [0, -1.3, 0.3], [1.9, 2, 2], 'leather', 3),
-    chrP('shR', 'rc', [0, 0, 0], [2.3, 1.9], 'shirt', 4, { b: [0, -5.8, 0], pat: chrPat.plaid }),
-    chrP('elR', 'rc', [0, 0, 0], [1.9, 1.6], 'skin', 4, { b: [0, -5, 0.3] }),
-    chrP('haR', 'ell', [0, -1.3, 0.3], [1.9, 2, 2], 'leather', 4),
-    chrP('hipL', 'rc', [0, 0, 0], [2.7, 2.1], 'denim', 5, { b: [0, -6, 0] }),
-    chrP('knL', 'rc', [0, 0, 0], [2.1, 1.8], 'denim', 5, { b: [0, -5.4, 0.3] }),
-    chrP('ftL', 'ell', [0, -1.2, 1.2], [2.3, 1.7, 3.3], 'boot', 5),
-    chrP('hipR', 'rc', [0, 0, 0], [2.7, 2.1], 'denim', 6, { b: [0, -6, 0] }),
-    chrP('knR', 'rc', [0, 0, 0], [2.1, 1.8], 'denim', 6, { b: [0, -5.4, 0.3] }),
-    chrP('ftR', 'ell', [0, -1.2, 1.2], [2.3, 1.7, 3.3], 'boot', 6),
-    // pickaxe resting on the right shoulder
-    chrP('wpn', 'cyl', [0, 0, 3], [0.65, 8, 0.65], 'wood', 7, { rot: [Math.PI / 2, 0, 0] }),
-    chrP('wpn', 'cone', [0, 3.4, 10.4], [1.1, 4, 1.1], 'iron', 7),
-    chrP('wpn', 'cone', [0, -3.4, 10.4], [1.1, 4, 1.1], 'iron', 7, { rot: [Math.PI, 0, 0] }),
-    // lantern in the left hand
-    chrP('off', 'cyl', [0, -2.6, 0.4], [1.8, 2.2, 1.8], 'glowY', 8),
-    chrP('off', 'cyl', [0, -0.1, 0.4], [2, 0.5, 2], 'brass', 8),
-    chrP('off', 'cyl', [0, -5, 0.4], [2, 0.5, 2], 'brass', 8),
-    chrP('off', 'cyl', [0, 0.8, 0.4], [0.4, 0.8, 0.4], 'brass', 8),
-  ],
-  pts: { top: ['head', [0, 13, 0]], lamp: ['head', [0, 9.2, 6]], lantern: ['off', [0, -2.6, 0.4]] },
+  size: [72, 80], anchor: [36, 62],
+  mats: CHR_MINER_MATS,
+  views: chrMinerViews(),
   anims: {
     idle: {
       n: 8,
       fn(t, P) {
-        const b = chrS(t), b2 = chrS(t, 0.2);
-        P.o.chest = [0, 0.3 * b, 0];
-        P.j.head = [0.05 * b2, 0.06 * chrS(t, 0.5), 0];
-        P.j.shR = [-1.2, 0.3, -0.5]; P.j.elR = [-1.9, 0, 0]; P.j.wpn = [-0.3, 0, 0.9];
-        P.j.shL = [-0.3, 0, 0.05]; P.j.elL = [-0.6, 0, 0]; P.j.off = [0.6 + 0.12 * chrS(t, 0.1), 0, 0.1 * b2];
-        P.j.knL = [0.1, 0, 0]; P.j.knR = [0.1, 0, 0];
-        P.t = [0, -0.2 + 0.2 * b, 0];
+        const b = chrS(t), sg = P.view === 'back' ? -1 : 1;
+        P.o.torso = [0, b > 0.4 ? 0.5 : 0];
+        P.r.armR = sg * (10 + 2 * b); P.r.armL = sg * (-8 - 2 * b); P.r.lantern = sg * (8 + 6 * chrS(t, 0.1));
+        P.r.armN = -10 + 2 * b; P.r.armF = -6; P.r.head = 2 * b;
       },
     },
     // the lantern raised and swung to call the Butcher over
     wave: {
       n: 8,
       fn(t, P) {
-        CHR.models.miner.anims.idle.fn(t, P);
-        const b = chrS(t);
-        P.j.shL = [-2.4, 0, 0.35 + 0.25 * b]; P.j.elL = [-0.5, 0, 0]; P.j.off = [2.4 + 0.25 * b, 0, 0];
-        P.j.head = [-0.1, 0.1, 0.05 * b];
+        const b = chrS(t), sg = P.view === 'back' ? -1 : 1;
+        P.r.armR = sg * 10;
+        P.r.armL = sg * (-150 - 22 * b); P.r.lantern = sg * (150 + 22 * b);
+        P.r.armN = -10; P.r.armF = 150 + 20 * b; P.r.lantern = P.view === 'side' ? -150 - 20 * b : P.r.lantern;
+        P.r.head = 4 * chrS(t, 0.2);
       },
     },
   },
-};
-
-// dialog portrait: a bigger render of the head and shoulders, cropped; flags e.g. { mouth: 1 }
-CHR.portrait = function (kind, anim, f, rows, flags = {}) {
-  const v = 'p' + JSON.stringify(flags), key = 'portrait|' + kind + '|' + anim + '|' + f + '|' + v;
-  let fr = this.cache.get(key);
-  if (!fr) {
-    const full = this.frame(kind, anim, 1, f, { k: 3.4, v, f: flags });
-    const h = Math.min(rows, full.h);
-    const [c, g] = makeCanvas(full.w, h);
-    g.drawImage(full.cv, 0, 0);
-    fr = { cv: c, ax: full.ax, ay: full.ay, hires: true };
-    this.cache.set(key, fr);
-  }
-  return fr;
 };
 
 </script>
@@ -6111,11 +6031,11 @@ const PLAYER_BASE = { hp: 100, regen: 0.5, ms: 1, range: 3.4, crit: 0.08, critMu
 
 // enemy archetypes: character model, collision radius (m), move speed (m/s), devour scale, walk stride (px per cycle)
 const ENEMY_KINDS = {
-  easy: { sprite: 'bandit', rad: 0.5, speed: 3, devour: 1, stride: 27 },
-  knight: { sprite: 'knight', rad: 0.6, speed: 3, devour: 1, stride: 30 },
-  knight2: { sprite: 'knight2', rad: 0.6, speed: 3, devour: 1, stride: 33 },
-  boss: { sprite: 'troll', rad: 1.0, speed: 4.5, devour: 1.5, stride: 54 },
-  elite: { sprite: 'golem', rad: 0.6, speed: 3, devour: 1.2, stride: 46 },
+  easy: { sprite: 'swordman', rad: 0.5, speed: 3, devour: 1, stride: 26 },
+  knight: { sprite: 'spearman', rad: 0.6, speed: 3, devour: 1, stride: 30 },
+  knight2: { sprite: 'spearman', rad: 0.6, speed: 3, devour: 1, stride: 30 },
+  boss: { sprite: 'troll', rad: 1.0, speed: 4.5, devour: 1.5, stride: 52 },
+  elite: { sprite: 'tree', rad: 0.6, speed: 3, devour: 1.2, stride: 50 },
 };
 
 // reward: hp (max HP), regen (/s), cut (flat cut damage), ms (move-speed level), item, slot, gate
@@ -6344,7 +6264,7 @@ function drawSmear(ctx, cx, cy, o, part) {
 // ---------------------------------------------------------------------------
 const HP_ANCHOR = { easy: 2.363, knight: 2.84, knight2: 2.84, boss: 4.73, elite: 6.15, tree: 4.43 };
 const BAR_W = { easy: 34, knight: 44, knight2: 46, boss: 64, elite: 68, tree: 40 };
-const UNIT_SHADOW = { bandit: [26, 8], knight: [30, 9], knight2: [34, 10], troll: [104, 27], golem: [112, 28] };
+const UNIT_SHADOW = { swordman: [26, 8], spearman: [30, 9], troll: [96, 24], tree: [100, 26] };
 
 // small canvas previewing what a kill gives: "+3<heart>", a weapon icon, the gate
 function rewardTex(rw) {
@@ -6455,7 +6375,7 @@ class Enemy {
   frameH() { return CHR.frame(this.sprite, 'idle', 2, 0).top; }
   // the animation frame for the current state
   frame() {
-    const k = this.sprite, d = CHR.dirOf(this.face);
+    const k = this.sprite, d = (this.vdir = CHR.dirOf(this.face, this.vdir));
     if (this.atkT >= 0) return CHR.at(k, 'attack', d, Math.min(1, this.atkT));
     if (this.hitT < 0.2) return CHR.at(k, 'hit', d, this.hitT / 0.2);
     if (this.moving > 0.3) return CHR.at(k, 'walk', d, this.walkPh / TAU);
@@ -6979,7 +6899,7 @@ class Girl {
     }
   }
   frame() {
-    const d = CHR.dirOf(this.face);
+    const d = (this.vdir = CHR.dirOf(this.face, this.vdir));
     if (this.stoneT >= 0) {
       // the stone line climbs from the feet to above the head (model units)
       const q = Math.round(this.stone * 24), lvl = -2 + (q / 24) * 50;
@@ -7302,7 +7222,7 @@ class Hero {
   // ---- frames and landmarks ------------------------------------------------
   // the animation frame for the current state (rendered once, then cached)
   frame() {
-    const d = CHR.dirOf(this.face), s0 = this.slots[0], o = { w: s0.item ? s0.item.id : '' };
+    const d = (this.vdir = CHR.dirOf(this.face, this.vdir)), s0 = this.slots[0], o = { w: s0.item ? s0.item.id : '' };
     const q = this.seq;
     if (q) {
       if (q.death && q.t < DEATH_T.sink) return CHR.at('butcher', 'die', d, q.t / 0.9, o);
@@ -7516,7 +7436,7 @@ class Hero {
     const gy = groundY(this.x, this.y) - this.z;
     return [
       this.x + Math.cos(ha) * 44 + Math.cos(t * 2) * 5,
-      gy + Math.sin(ha) * 30 - 58 + Math.sin(t * 2.6) * 3,
+      gy + Math.sin(ha) * 30 - 64 + Math.sin(t * 2.6) * 3,
       this.y + Math.sin(ha) * 44,
     ];
   }
@@ -7853,14 +7773,14 @@ class Hero {
       const tail = ph < 0.38 ? 0 : clamp(ease.inQuad((ph - 0.38) / 0.24), 0, 1);
       if (head - tail < 0.01) return null;
       const d = s.alt ? -1 : 1;
-      return { x: this.x, y: this.y, z: 50 + this.z, r: 50, a0: this.face - d * 1.92, a1: this.face + d * 1.75, head, tail, cols: W.slash, thick: 9, flat: 0.62, dz: -14 };
+      return { x: this.x, y: this.y, z: 34 + this.z, r: 50, a0: this.face - d * 1.92, a1: this.face + d * 1.75, head, tail, cols: W.slash, thick: 9, flat: 0.62, dz: -14 };
     }
     if (anim === 'smash') {
       const head = ph < 0.28 ? 0 : Math.min(1, ease.inQuad((ph - 0.28) / 0.14));
       const tail = ph < 0.36 ? 0 : clamp(ease.inQuad((ph - 0.36) / 0.2), 0, 1);
       if (head - tail < 0.01) return null;
       const fx = Math.cos(this.face), fy = Math.sin(this.face);
-      return { x: this.x + fx * 10, y: this.y + fy * 10, z: 46 + this.z, r: 46, a0: -0.95, a1: 2.15, head, tail, cols: W.slash, thick: 9, flat: 0.62, plane: 'v', face: this.face };
+      return { x: this.x + fx * 10, y: this.y + fy * 10, z: 38 + this.z, r: 46, a0: -0.95, a1: 2.15, head, tail, cols: W.slash, thick: 9, flat: 0.62, plane: 'v', face: this.face };
     }
     return null;
   }
@@ -7946,7 +7866,7 @@ class Hero {
       const tail = ph < 0.3 ? 0 : clamp((ph - 0.3) / 0.25, 0, 1);
       const gy = groundY(this.x, this.y) - this.z, tg = s0.tgt;
       const ty = groundY(tg.x, tg.y) - this.targetHeight(tg);
-      drawThrust(ctx, this.x - cx, gy - 48 - cy, tg.x - cx, ty - cy, W.slash, head, tail, 3);
+      drawThrust(ctx, this.x - cx, gy - 30 - cy, tg.x - cx, ty - cy, W.slash, head, tail, 3);
     }
   }
 
@@ -8931,7 +8851,7 @@ UI.drawInventory = function (ctx, M) {
   ctx.globalAlpha = a * 0.5;
   ctx.drawImage(sh, Math.round(bx + bw / 2 - sh.width / 2), Math.round(by + 97 - sh.height / 2));
   ctx.globalAlpha = a;
-  CHR.draw(ctx, CHR.at('butcher', 'idle', 2, t / 2.6, { k: 0.86, w: h.slots[0].item ? h.slots[0].item.id : '' }), Math.round(bx + bw / 2), by + 97);
+  CHR.draw(ctx, CHR.at('butcher', 'idle', 2, t / 2.6, { w: h.slots[0].item ? h.slots[0].item.id : '' }), Math.round(bx + bw / 2), by + 97);
   ctx.restore();
 
   // equipped weapons
@@ -9802,7 +9722,7 @@ Game.init = function () {
   if (q.has('bot')) this.bot = gameBotNew();
   this.snapCam();
   this.initAmbient();
-  CHR.warm('butcher', ['cutA', 'cutB'], { w: 'knife' }, [2, 1, 3, 0, 4, 6, 5, 7], true);
+  CHR.warm('butcher', ['cutA', 'cutB'], { w: 'knife' }, [2, 0, 4, 6], true);
   this.perf.init = Math.round(performance.now() - t0);
 };
 
@@ -10756,7 +10676,7 @@ Game.warmChars = function () {
   const h = this.hero;
   if (!h || !this.dropped) return;
   const w = h.slots[0].item ? h.slots[0].item.id : '', a = h.handAnim();
-  const d0 = CHR.dirOf(h.face), all = [0, 1, -1, 2, -2, 3, -3, 4].map(k => (d0 + k + 8) % 8);
+  const d0 = CHR.dirOf(h.face, h.vdir), all = [d0, ...[2, 0, 4, 6].filter(d => d !== d0)];
   CHR.warm('butcher', a === 'cut' ? ['cutA', 'cutB'] : [a], { w }, all, true);
   CHR.warm('butcher', ['walk', 'idle'], { w }, all, true);
   CHR.warm('butcher', ['gulp', 'land', 'roar'], { w }, all);
@@ -10764,7 +10684,7 @@ Game.warmChars = function () {
     if (!e.alive || e.hidden || e.dist > (e.heavy ? 36 : 24) * PPM) continue;
     // the side facing the Butcher first: that is where the fight will be seen from
     const de = CHR.dirOf(Math.atan2(h.y - e.y, h.x - e.x));
-    CHR.warm(e.sprite, ['idle', 'attack', 'walk', 'hit'], {}, [de, (de + 1) % 8, (de + 7) % 8]);
+    CHR.warm(e.sprite, ['idle', 'attack', 'walk', 'hit'], {}, [de, ...[2, 0, 4, 6].filter(d => d !== de)]);
   }
 };
 
@@ -10924,9 +10844,9 @@ window.__state = () => {
     UI.buildMap();
     t = mark('map', t);
     // character frames the first seconds need, in all 8 directions
-    const w = { w: 'knife' }, warm = [['butcher', 'idle', w], ['butcher', 'walk', w], ['bandit', 'idle'], ['bandit', 'walk']];
+    const w = { w: 'knife' }, warm = [['butcher', 'idle', w], ['butcher', 'walk', w], ['swordman', 'idle'], ['swordman', 'walk']];
     for (const [kind, anim, o] of warm) {
-      for (let d = 0; d < 8; d++) for (let f = 0; f < CHR.anim(kind, anim).n; f++) CHR.frame(kind, anim, d, f, o);
+      for (const d of [2, 0, 4, 6]) for (let f = 0; f < CHR.anim(kind, anim).n; f++) CHR.frame(kind, anim, d, f, o);
       await idle();
     }
     for (const [anim, n] of [['fall', 2], ['land', 6], ['roar', 8]]) for (let f = 0; f < n; f++) CHR.frame('butcher', anim, 2, f, w);
